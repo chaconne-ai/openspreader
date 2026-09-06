@@ -13,34 +13,74 @@
 	<version>1.0.0-SNAPSHOT</version>
 	<name>openspreader</name>
 	<description>
-		Spring Boot starter for spreader: turns a cluster of ordinary Spring Boot
-		applications into a set of tools that work across processes.
+		A complete set of multi-process programming components for Spring Boot:
+		distributed locks, semaphores, latches and barriers, a process pool, a
+		replicated cache, cluster-wide scheduling, RPC and MapReduce-style aggregation,
+		all on top of the embedded spreader cluster.
 
-		Distributed lock, semaphore, count-down latch and cyclic barrier - the same
-		shape as their java.util.concurrent counterparts, only cluster-wide.
-		A replicated cache that ships operations rather than data. Scheduled tasks
-		that run on exactly one instance. Task distribution over @MultiProcessing and
-		remote calls over @RpcClient, both as plain annotations on plain beans.
+		Each component keeps the shape of its java.util.concurrent counterpart and
+		spans every instance of the application instead of one JVM. A ProcessingMutex is
+		acquired and released like a ReentrantLock; a ProcessingSemaphore hands out
+		permits the same way; the process pool takes a method call on one instance and
+		runs it on another. The cluster itself is spreader, running inside the same JVM
+		as the application's beans, so there is no Redis, no ZooKeeper and no message
+		broker in the picture.
 
-		Metrics go to Prometheus and cluster health joins the actuator endpoints, so
-		existing dashboards and probes pick them up without extra work.
+		Every component has two scopes: one confined to instances of the same
+		application, one spanning everything on the cluster port. The cache replicates by
+		shipping operations rather than data, so a setbit on a 100MB bitmap costs one
+		datagram and a cluster-wide Bloom filter becomes practical; every node holds a
+		full replica, so reads never leave the process. Scheduled tasks fire on every
+		instance but run on exactly one. The process pool over @MultiProcessingCall and
+		remote calls over @RpcClient, which routes by application name rather than by
+		URL, are plain annotations on plain beans.
 
-		Every component is off by default and enabled through properties: adding this
-		starter changes nothing until you ask for something.
+		Every failure surfaces as ProcessingException, split by cause rather than summed
+		into one rate. Metrics go to Prometheus and cluster health joins the actuator
+		endpoints, carrying each member's HTTP address, so one node's health response is
+		enough to reach any other.
+
+		The limits of the underlying cluster are inherited rather than hidden:
+		leadership is not consensus, and the cache is memory only. Under a network
+		partition two sides can each hold a leader, and a full cluster restart starts
+		from empty. If double execution is unacceptable, this is not the tool.
+
+		Nothing is enabled by default. Every component is switched on through
+		properties, so adding this starter to a running service changes nothing until
+		one of them is asked for.
 	</description>
-	<url/>
+	<url>https://github.com/chaconne-ai/openspreader</url>
+	<inceptionYear>2026</inceptionYear>
+	<organization>
+		<name>ChaconneAI</name>
+		<url>https://github.com/chaconne-ai</url>
+	</organization>
 	<licenses>
-		<license/>
+		<license>
+			<name>Apache License, Version 2.0</name>
+			<url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+			<distribution>repo</distribution>
+		</license>
 	</licenses>
 	<developers>
-		<developer/>
+		<developer>
+			<id>fredfeng</id>
+			<name>Fred Feng</name>
+			<email>paganini.fy@gmail.com</email>
+			<organization>ChaconneAI</organization>
+			<organizationUrl>https://github.com/chaconne-ai</organizationUrl>
+		</developer>
 	</developers>
 	<scm>
-		<connection/>
-		<developerConnection/>
-		<tag/>
-		<url/>
+		<connection>scm:git:https://github.com/chaconne-ai/openspreader.git</connection>
+		<developerConnection>scm:git:ssh://git@github.com/chaconne-ai/openspreader.git</developerConnection>
+		<tag>HEAD</tag>
+		<url>https://github.com/chaconne-ai/openspreader</url>
 	</scm>
+	<issueManagement>
+		<system>GitHub Issues</system>
+		<url>https://github.com/chaconne-ai/openspreader/issues</url>
+	</issueManagement>
 	<properties>
 		<java.version>17</java.version>
 	</properties>
@@ -242,7 +282,67 @@
 					</execution>
 				</executions>
 			</plugin>
+
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-gpg-plugin</artifactId>
+				<version>3.2.8</version>
+
+				<!--
+				  Loopback pinentry. The plugin runs gpg in batch mode, and with no
+				  graphical pinentry installed gpg has nowhere to ask for the passphrase,
+				  so it fails with "Inappropriate ioctl for device". Loopback makes gpg
+				  take the passphrase from Maven instead, given as -Dgpg.passphrase on
+				  the command line or set in settings.xml.
+				-->
+				<configuration>
+					<gpgArguments>
+						<arg>--pinentry-mode</arg>
+						<arg>loopback</arg>
+					</gpgArguments>
+				</configuration>
+
+				<executions>
+					<execution>
+						<id>sign-artifacts</id>
+						<phase>verify</phase>
+
+						<goals>
+							<goal>sign</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+
+			<plugin>
+				<groupId>org.sonatype.central</groupId>
+				<artifactId>central-publishing-maven-plugin</artifactId>
+				<version>0.9.0</version>
+
+				<extensions>true</extensions>
+
+				<configuration>
+					<publishingServerId>central</publishingServerId>
+					<autoPublish>true</autoPublish>
+				</configuration>
+			</plugin>
 		</plugins>
 	</build>
+
+	<repositories>
+		<repository>
+			<id>central-portal-snapshots</id>
+			<name>Central Portal Snapshots</name>
+			<url>https://central.sonatype.com/repository/maven-snapshots/</url>
+
+			<releases>
+				<enabled>false</enabled>
+			</releases>
+
+			<snapshots>
+				<enabled>true</enabled>
+			</snapshots>
+		</repository>
+	</repositories>
 
 </project>
