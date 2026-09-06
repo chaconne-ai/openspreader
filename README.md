@@ -8,7 +8,7 @@
 **A complete set of multi-process programming components for Spring Boot:
 distributed locks, semaphores, latches and barriers, a process pool, a
 replicated cache, cluster-wide scheduling, RPC and MapReduce-style aggregation,
-all on top of the embedded [`spreader`](../spreader) cluster.**
+all on top of the embedded [`spreader`](https://github.com/chaconne-ai/spreader) cluster.**
 
 Each component keeps the shape of its `java.util.concurrent` counterpart and
 spans every instance of the application instead of one JVM. A `ProcessingMutex`
@@ -74,7 +74,7 @@ public class ReportService {
 | You want a read-heavy shared cache and can tolerate a few milliseconds of staleness | Yes. Reads are local and roughly a thousand times cheaper than writes |
 | You need the cache to survive a full cluster restart | No. It is memory only, by decision. Use Redis if the data must outlive the processes |
 | "This must never run twice, **ever**": money moves, or a ledger is written | **No. Use Raft**, or a database transaction |
-| You are not on Spring Boot | Use [`spreader`](../spreader) directly, the library underneath this one |
+| You are not on Spring Boot | Use [`spreader`](https://github.com/chaconne-ai/spreader) directly, the library underneath this one |
 | You already operate Redis and ZooKeeper for other reasons | Probably not worth the swap. The operational cost you would save is already being paid |
 
 
@@ -107,11 +107,15 @@ install, monitor, and be woken up by.
 openspreader gives you the same shapes, cluster-wide, and the coordination
 happens between your own instances: there is **no external service** in the
 picture at all. Membership and leader election come from
-[`spreader`](../spreader), which runs inside the same JVM as your beans, so a
+[`spreader`](https://github.com/chaconne-ai/spreader), which runs inside the same JVM as your beans, so a
 lock acquired on the leader costs a message rather than a network service call.
 
 
 ## Installation
+
+> **This is a snapshot release.** Snapshots do not live in the Maven Central
+> release repository, so the repository below has to be declared as well or the
+> dependency will not resolve.
 
 **Maven**
 
@@ -123,10 +127,28 @@ lock acquired on the leader costs a message rather than a network service call.
 </dependency>
 ```
 
+```xml
+<repositories>
+    <repository>
+        <id>central-snapshots</id>
+        <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+        <releases><enabled>false</enabled></releases>
+        <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+</repositories>
+```
+
 **Gradle**
 
 ```groovy
 implementation 'com.chaconne-ai:openspreader:1.0.0-SNAPSHOT'
+```
+
+```groovy
+repositories {
+    mavenCentral()
+    maven { url 'https://central.sonatype.com/repository/maven-snapshots/' }
+}
 ```
 
 ### Requirements
@@ -135,7 +157,7 @@ implementation 'com.chaconne-ai:openspreader:1.0.0-SNAPSHOT'
 |---|---|
 | **Java** | 17 or later |
 | **Spring Boot** | 4.1, built and tested against it; see the note below |
-| **Runtime dependencies** | [`spreader`](../spreader), plus Spring Boot itself |
+| **Runtime dependencies** | [`spreader`](https://github.com/chaconne-ai/spreader), plus Spring Boot itself |
 | **Optional** | Micrometer for Prometheus; Kryo for faster serialisation; Netty, MINA or Grizzly for an alternative transport |
 | **Ports** | one cluster port, identical on every node (22000 by default), plus one work port per node |
 
