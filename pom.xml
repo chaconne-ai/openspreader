@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>4.1.0</version>
+		<relativePath/> <!-- lookup parent from repository -->
+	</parent>
+	<groupId>com.chaconne-ai</groupId>
+	<artifactId>openspreader</artifactId>
+	<version>1.0.0-SNAPSHOT</version>
+	<name>openspreader</name>
+	<description>
+		Spring Boot starter for spreader: turns a cluster of ordinary Spring Boot
+		applications into a set of tools that work across processes.
+
+		Distributed lock, semaphore, count-down latch and cyclic barrier - the same
+		shape as their java.util.concurrent counterparts, only cluster-wide.
+		A replicated cache that ships operations rather than data. Scheduled tasks
+		that run on exactly one instance. Task distribution over @MultiProcessing and
+		remote calls over @RpcClient, both as plain annotations on plain beans.
+
+		Metrics go to Prometheus and cluster health joins the actuator endpoints, so
+		existing dashboards and probes pick them up without extra work.
+
+		Every component is off by default and enabled through properties: adding this
+		starter changes nothing until you ask for something.
+	</description>
+	<url/>
+	<licenses>
+		<license/>
+	</licenses>
+	<developers>
+		<developer/>
+	</developers>
+	<scm>
+		<connection/>
+		<developerConnection/>
+		<tag/>
+		<url/>
+	</scm>
+	<properties>
+		<java.version>17</java.version>
+	</properties>
+	<dependencies>
+		<dependency>
+			<groupId>com.chaconne-ai</groupId>
+			<artifactId>spreader</artifactId>
+			<version>1.0.0-SNAPSHOT</version>
+		</dependency>
+
+		<!-- spreader has no logging dependency of its own, so declare slf4j here -->
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-api</artifactId>
+		</dependency>
+
+		<dependency>
+			<groupId>org.projectlombok</groupId>
+			<artifactId>lombok</artifactId>
+			<optional>true</optional>
+		</dependency>
+
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-autoconfigure</artifactId>
+		</dependency>
+
+		<!--
+		  Generates META-INF/spring-configuration-metadata.json from the
+		  @ConfigurationProperties classes, so every property this starter exposes
+		  gets IDE completion, type info and the javadoc as its description.
+
+		  Without it the four properties classes (111 fields in total) are invisible
+		  to the IDE: no completion, no documentation, and a typo in application.yml
+		  fails silently instead of being flagged as an unknown key.
+
+		  optional + provided-style: it is an annotation processor, needed only while
+		  compiling this module. It must not leak onto any downstream classpath.
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-configuration-processor</artifactId>
+			<optional>true</optional>
+		</dependency>
+
+		<!--
+		  Optional, so downstream projects don't inherit them:
+		  - kryo: only when serialization=KRYO. Missing it fails fast at startup
+		    with a clear message rather than a later NoClassDefFoundError.
+		  - spring-retry: only when using RPC (@RpcClient).
+		-->
+		<!--
+		  Observability, also optional:
+		  - micrometer-core: exports metrics to Prometheus.
+		  - actuator: adds the /actuator/spreader endpoint and cluster health.
+		  Without either, MetricsService is still injectable and fully usable.
+		-->
+		<!--
+		  Optional as well: the WebServerInitializedEvent that tells the node its real
+		  HTTP ports lives in this module, which a non-web application does not have.
+		  The listener that uses it is behind @ConditionalOnClass, so a batch job or a
+		  command-line tool starts exactly as before.
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-web-server</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-core</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>com.esotericsoftware</groupId>
+			<artifactId>kryo</artifactId>
+			<version>5.6.2</version>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.retry</groupId>
+			<artifactId>spring-retry</artifactId>
+			<version>2.0.12</version>
+			<optional>true</optional>
+		</dependency>
+
+	</dependencies>
+
+	<build>
+		<plugins>
+			<!--
+			  This is a library, not an application. repackage must stay off:
+			  it would move classes into BOOT-INF/classes, where nothing
+			  depending on this jar can find them.
+			-->
+			<plugin>
+				<groupId>org.springframework.boot</groupId>
+				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<skip>true</skip>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>default-compile</id>
+						<phase>compile</phase>
+						<goals>
+							<goal>compile</goal>
+						</goals>
+						<configuration>
+							<!--
+							  Once annotationProcessorPaths is configured explicitly,
+							  processors on the classpath are no longer discovered
+							  automatically. So configuration-processor has to be listed
+							  here as well: adding it to dependencies alone is not enough,
+							  and nothing reports an error; the metadata file is simply
+							  never generated.
+							-->
+							<annotationProcessorPaths>
+								<path>
+									<groupId>org.projectlombok</groupId>
+									<artifactId>lombok</artifactId>
+								</path>
+								<path>
+									<groupId>org.springframework.boot</groupId>
+									<artifactId>spring-boot-configuration-processor</artifactId>
+									<version>${spring-boot.version}</version>
+								</path>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+					<execution>
+						<id>default-testCompile</id>
+						<phase>test-compile</phase>
+						<goals>
+							<goal>testCompile</goal>
+						</goals>
+						<configuration>
+							<annotationProcessorPaths>
+								<path>
+									<groupId>org.projectlombok</groupId>
+									<artifactId>lombok</artifactId>
+								</path>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+
+			<!-- Sources jar for publishing -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-source-plugin</artifactId>
+				<version>3.3.1</version>
+				<executions>
+					<execution>
+						<id>attach-sources</id>
+						<goals>
+							<goal>jar-no-fork</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+
+			<!--
+			  Javadoc jar for publishing. doclint is off: the docs here are written
+			  for people reading the source, and blocking a release over a missing
+			  @param tag helps nobody.
+
+			  failOnError is off too, because Lombok-generated getters carry no
+			  javadoc and optional dependencies may be absent at doc time.
+			-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<version>3.11.2</version>
+				<configuration>
+					<doclint>none</doclint>
+					<quiet>true</quiet>
+					<encoding>UTF-8</encoding>
+					<charset>UTF-8</charset>
+					<docencoding>UTF-8</docencoding>
+					<failOnError>false</failOnError>
+				</configuration>
+				<executions>
+					<execution>
+						<id>attach-javadocs</id>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+
+</project>

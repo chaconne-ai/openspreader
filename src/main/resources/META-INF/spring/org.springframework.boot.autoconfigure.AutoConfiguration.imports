@@ -1,0 +1,4 @@
+com.chaconneai.openspreader.ApplicationClusterAutoConfiguration
+com.chaconneai.openspreader.MultiProcessingAutoConfiguration
+com.chaconneai.openspreader.RpcAutoConfiguration
+com.chaconneai.openspreader.metrics.MetricsAutoConfiguration
