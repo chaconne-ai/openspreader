@@ -23,6 +23,7 @@ import java.nio.file.Path;
 import com.chaconneai.openspreader.cache.ProcessingCache;
 import com.chaconneai.openspreader.cache.MultiProcessingCache;
 import com.chaconneai.openspreader.sync.BarrierService;
+import com.chaconneai.openspreader.sync.ExchangerService;
 import com.chaconneai.openspreader.sync.LatchService;
 import com.chaconneai.openspreader.sync.MutexService;
 import com.chaconneai.openspreader.sync.MultiProcessingSyncService;
@@ -60,7 +61,7 @@ import org.springframework.scheduling.TaskScheduler;
 
 /**
  * Auto-configuration for the multi-processing toolkit: locks, semaphores, latches, barriers,
- * scheduled-task exclusion, the process pool, and the cluster cache.
+ * exchange points, scheduled-task exclusion, the process pool, and the cluster cache.
  *
  * <p>All of it is built on {@link GossipCluster}, so it comes after
  * {@link ApplicationClusterAutoConfiguration}, which brings the cluster up. Without a cluster
@@ -140,7 +141,7 @@ public class MultiProcessingAutoConfiguration {
     }
 
     // ------------------------------------------------------------------
-    // Cross-process latches and barriers
+    // Cross-process latches, barriers and exchange points
     // ------------------------------------------------------------------
 
     /**
@@ -174,9 +175,31 @@ public class MultiProcessingAutoConfiguration {
     }
 
     /**
-     * The single entry point for locks, latches and barriers.
+     * The exchange point service.
      *
-     * <p>The four services have <b>switches of their own</b>, so they are injected through
+     * <p>It takes the {@link ObjectCodec} the rest of the toolkit uses, because unlike the
+     * other synchronisers it moves <b>items</b> rather than names and counts. So the cluster
+     * must be configured the same way throughout: with the two sides on different
+     * serialisations, an exchange pairs successfully and then fails to decode what it was
+     * handed.
+     */
+    @Bean(destroyMethod = "close")
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.exchanger", name = "enabled",
+            havingValue = "true", matchIfMissing = false)
+    public ExchangerService exchangerService(GossipCluster cluster, MultiProcessingProperties props,
+            ObjectCodec codec, ExecutorServiceHolder executors) {
+        MultiProcessingProperties.Exchanger x = props.getExchanger();
+        ExchangerService service = new ExchangerService(cluster, codec, x.getRequestTimeoutMs(),
+                x.getIdleTimeoutMs(), executors);
+        service.start();
+        return service;
+    }
+
+    /**
+     * The single entry point for locks, semaphores, latches, barriers and exchange points.
+     *
+     * <p>The five services have <b>switches of their own</b>, so they are injected through
      * {@code ObjectProvider} rather than directly: switching locks on without latches is a
      * perfectly ordinary usage, and direct injection would fail the whole configuration for a
      * missing bean. An absent one is passed as {@code null}, and
@@ -190,9 +213,11 @@ public class MultiProcessingAutoConfiguration {
             ObjectProvider<LatchService> latchService,
             ObjectProvider<BarrierService> barrierService,
             ObjectProvider<SemaphoreService> semaphoreService,
+            ObjectProvider<ExchangerService> exchangerService,
             GossipCluster cluster) {
         return new MultiProcessingSyncService(mutexService.getIfAvailable(), latchService.getIfAvailable(),
-                barrierService.getIfAvailable(), semaphoreService.getIfAvailable(), cluster);
+                barrierService.getIfAvailable(), semaphoreService.getIfAvailable(),
+                exchangerService.getIfAvailable(), cluster);
     }
 
     /**

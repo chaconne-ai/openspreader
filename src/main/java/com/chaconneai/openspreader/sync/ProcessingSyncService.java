@@ -20,8 +20,8 @@ import com.chaconneai.openspreader.Scope;
 import java.util.Map;
 
 /**
- * The <b>single entry point</b> for cross-process synchronisers: locks, latches and barriers
- * all come from here.
+ * The <b>single entry point</b> for cross-process synchronisers: locks, semaphores, latches,
+ * barriers and exchange points all come from here.
  *
  * <pre>{@code
  * // One holder across the whole cluster, without regard to application
@@ -33,9 +33,10 @@ import java.util.Map;
  *
  * ProcessingCountDownLatch latch = sync.applicationLatch("batch-done", 3);
  * ProcessingCyclicBarrier barrier = sync.applicationBarrier("phase", 4);
+ * ProcessingExchanger<Batch> point = sync.applicationExchanger("buffer-swap");
  * }</pre>
  *
- * <h2>Why all three share one entry point</h2>
+ * <h2>Why they all share one entry point</h2>
  * The rules for obtaining them are <b>identical</b> -- the same two granularities, the same
  * caching by name, the same "same name, different parameters, error". Split across three
  * factories, those rules would be written out three times, and the risk of changing one and
@@ -234,6 +235,56 @@ public interface ProcessingSyncService {
     }
 
     // ------------------------------------------------------------------
+    // Exchange points
+    // ------------------------------------------------------------------
+
+    /**
+     * Obtains an exchange point at the given granularity.
+     *
+     * <p><b>One name returns one instance</b>, as everywhere else here. An exchange point
+     * takes no parameter to agree on -- it is always two parties, always the next two to
+     * arrive -- so unlike a latch or a barrier there is nothing here to refuse, and the same
+     * name may be asked for with a different {@code V} without complaint. See
+     * {@link MultiProcessingExchanger} for what that costs.
+     *
+     * @param key the application's own name, any string
+     * @param <V> the type of item exchanged
+     */
+    <V> ProcessingExchanger<V> exchanger(Scope scope, String key);
+
+    /**
+     * A cluster-level exchange point: any two parties in the cluster may meet here,
+     * <b>without regard to application</b>.
+     *
+     * <p>Worth a moment's thought before using: the two sides of an exchange must agree on
+     * the item's type, and at cluster granularity the partner may be an application that
+     * knows nothing of the class being sent. Application granularity is usually what is
+     * wanted.
+     *
+     * @param key the application's own name, any string
+     * @param <V> the type of item exchanged
+     */
+    default <V> ProcessingExchanger<V> clusterExchanger(String key) {
+        return exchanger(Scope.CLUSTER, key);
+    }
+
+    /**
+     * An application-level exchange point: only instances of the same application meet here.
+     *
+     * <pre>{@code
+     * // Hand a full buffer to whichever instance is ready for one, and take back an empty
+     * ProcessingExchanger<Buffer> point = syncs.applicationExchanger("buffer-swap");
+     * Buffer empty = point.exchange(full, 30, TimeUnit.SECONDS);
+     * }</pre>
+     *
+     * @param key the application's own name, any string
+     * @param <V> the type of item exchanged
+     */
+    default <V> ProcessingExchanger<V> applicationExchanger(String key) {
+        return exchanger(Scope.APPLICATION, key);
+    }
+
+    // ------------------------------------------------------------------
     // Troubleshooting
     // ------------------------------------------------------------------
 
@@ -248,4 +299,7 @@ public interface ProcessingSyncService {
 
     /** The semaphores this process has created. */
     Map<String, ProcessingSemaphore> knownSemaphores();
+
+    /** The exchange points this process has created. */
+    Map<String, ProcessingExchanger<?>> knownExchangers();
 }

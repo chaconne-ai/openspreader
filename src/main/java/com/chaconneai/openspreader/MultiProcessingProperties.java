@@ -30,7 +30,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * {@code spring.spreader.multiprocessing}.
  *
  * <p>It covers only the tools built on top of the cluster: locks, semaphores, latches,
- * barriers, scheduled-task exclusion, the process pool and the cluster cache. <b>The cluster
+ * barriers, exchange points, scheduled-task exclusion, the process pool and the cluster
+ * cache. <b>The cluster
  * itself</b> -- its name, port, discovery, transport and timeouts -- lives under
  * {@code spring.spreader.*}; see {@link ApplicationClusterProperties}.
  *
@@ -77,6 +78,8 @@ public class MultiProcessingProperties {
     private Latch latch = new Latch();
 
     private Barrier barrier = new Barrier();
+
+    private Exchanger exchanger = new Exchanger();
 
     private Rpc rpc = new Rpc();
 
@@ -295,6 +298,37 @@ public class MultiProcessingProperties {
          * <p>A barrier is reusable, so this must exceed <b>the longest interval between
          * rounds</b>, or it would be swept away between them -- and the next round's parties
          * would find the generation out of step.
+         */
+        private long idleTimeoutMs = 300_000L;
+    }
+
+    /**
+     * The cross-process exchanger's configuration.
+     *
+     * <p>There is deliberately no party count here, as there is on {@link Barrier}: an
+     * exchange is always between two, and always the next two to arrive, so the two sides
+     * have nothing to agree on and nothing to get out of step about.
+     */
+    @Data
+    public static class Exchanger {
+
+        /** Whether it is enabled. */
+        private boolean enabled = false;
+
+        /** How long one request waits for the leader's reply, in milliseconds. */
+        private long requestTimeoutMs = 2_000L;
+
+        /**
+         * How long an exchange point may sit untouched before it is reclaimed, in
+         * milliseconds.
+         *
+         * <p>It does double duty. As elsewhere it sweeps records nobody uses, and it must
+         * therefore exceed <b>the longest interval between exchanges</b> under one name.
+         *
+         * <p>But it also bounds how long an <b>item</b> may sit unclaimed inside a record
+         * still in use -- which happens when a paired process dies between handing its item
+         * over and collecting the one meant for it. Set it far too high and one such death
+         * pins an item in the leader's memory for that long.
          */
         private long idleTimeoutMs = 300_000L;
     }

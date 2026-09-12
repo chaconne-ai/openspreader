@@ -22,6 +22,7 @@ import com.chaconneai.openspreader.pooling.PoolService;
 import com.chaconneai.openspreader.scheduling.MultiProcessingTaskStats;
 import com.chaconneai.openspreader.rpc.RpcService;
 import com.chaconneai.openspreader.sync.BarrierService;
+import com.chaconneai.openspreader.sync.ExchangerService;
 import com.chaconneai.openspreader.sync.LatchService;
 import com.chaconneai.openspreader.sync.MutexService;
 import com.chaconneai.openspreader.sync.SemaphoreService;
@@ -151,11 +152,13 @@ public class MetricsAutoConfiguration {
                 ObjectProvider<LatchService> latch,
                 ObjectProvider<BarrierService> barrier,
                 ObjectProvider<SemaphoreService> semaphore,
+                ObjectProvider<ExchangerService> exchanger,
                 ObjectProvider<RpcService> rpc) {
             return new SpreaderReportEndpoint(metrics, cache.getIfAvailable(),
                     mutex.getIfAvailable(), pool.getIfAvailable(), scheduled.getIfAvailable(),
                     latch.getIfAvailable(), barrier.getIfAvailable(),
-                    semaphore.getIfAvailable(), rpc.getIfAvailable());
+                    semaphore.getIfAvailable(), exchanger.getIfAvailable(),
+                    rpc.getIfAvailable());
         }
 
         /**
@@ -241,9 +244,9 @@ public class MetricsAutoConfiguration {
 
         /**
          * Component-level metrics: cache, locks, task dispatch, scheduled tasks, latches,
-         * barriers, semaphores and RPC.
+         * barriers, semaphores, exchange points and RPC.
          *
-         * <p>The eight components have <b>switches of their own</b>, so they are injected
+         * <p>The nine components have <b>switches of their own</b>, so they are injected
          * through {@code ObjectProvider} rather than directly: switching the cache on without
          * locks is a perfectly ordinary usage, and direct injection would stop the whole
          * application from starting over a missing bean. An absent one is passed as
@@ -261,16 +264,18 @@ public class MetricsAutoConfiguration {
                 ObjectProvider<LatchService> latch,
                 ObjectProvider<BarrierService> barrier,
                 ObjectProvider<SemaphoreService> semaphore,
+                ObjectProvider<ExchangerService> exchanger,
                 ObjectProvider<RpcService> rpc) {
             ComponentMeterBinder binder = new ComponentMeterBinder(
                     cache.getIfAvailable(), mutex.getIfAvailable(),
                     pool.getIfAvailable(), scheduled.getIfAvailable(),
                     latch.getIfAvailable(), barrier.getIfAvailable(),
-                    semaphore.getIfAvailable(), rpc.getIfAvailable());
+                    semaphore.getIfAvailable(), exchanger.getIfAvailable(),
+                    rpc.getIfAvailable());
             log.info("Component observability bound to Micrometer: spreader.cache.* / "
                     + "spreader.mutex.* / spreader.pool.* / spreader.scheduled.* / "
                     + "spreader.latch.* / spreader.barrier.* / spreader.semaphore.* / "
-                    + "spreader.rpc.*");
+                    + "spreader.exchanger.* / spreader.rpc.*");
             return binder;
         }
 

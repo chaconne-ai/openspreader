@@ -19,6 +19,7 @@ import com.chaconneai.openspreader.cache.CacheService;
 import com.chaconneai.openspreader.pooling.PoolService;
 import com.chaconneai.openspreader.rpc.RpcService;
 import com.chaconneai.openspreader.sync.BarrierService;
+import com.chaconneai.openspreader.sync.ExchangerService;
 import com.chaconneai.openspreader.sync.LatchService;
 import com.chaconneai.openspreader.sync.SemaphoreService;
 import com.chaconneai.openspreader.pooling.PoolStats;
@@ -80,19 +81,20 @@ public class SpreaderReportEndpoint {
     private final LatchService latch;
     private final BarrierService barrier;
     private final SemaphoreService semaphore;
+    private final ExchangerService exchanger;
     private final RpcService rpc;
 
     public SpreaderReportEndpoint(MetricsService metrics, CacheService cache,
                                   MutexService mutex, PoolService pool,
                                   MultiProcessingTaskStats scheduled) {
-        this(metrics, cache, mutex, pool, scheduled, null, null, null, null);
+        this(metrics, cache, mutex, pool, scheduled, null, null, null, null, null);
     }
 
     public SpreaderReportEndpoint(MetricsService metrics, CacheService cache,
                                   MutexService mutex, PoolService pool,
                                   MultiProcessingTaskStats scheduled, LatchService latch,
                                   BarrierService barrier, SemaphoreService semaphore,
-                                  RpcService rpc) {
+                                  ExchangerService exchanger, RpcService rpc) {
         this.metrics = metrics;
         this.cache = cache;
         this.mutex = mutex;
@@ -101,6 +103,7 @@ public class SpreaderReportEndpoint {
         this.latch = latch;
         this.barrier = barrier;
         this.semaphore = semaphore;
+        this.exchanger = exchanger;
         this.rpc = rpc;
     }
 
@@ -200,6 +203,14 @@ public class SpreaderReportEndpoint {
         if (barrier != null) {
             warns += check(sb, "Barriers broken", num(barrier.stats().get("broken")),
                     "another party timed out, was interrupted, departed, or the leader changed");
+        }
+        if (exchanger != null) {
+            Map<String, Object> xm = exchanger.stats();
+            warns += check(sb, "Exchange timeouts", num(xm.get("timeouts")),
+                    "no partner turned up, usually one side of the pairing never written");
+            warns += check(sb, "Exchange invalidations", num(xm.get("invalidations")),
+                    "the leader changed while parties were waiting; any exchange caught "
+                            + "mid-pairing lost its item");
         }
         if (rpc != null) {
             Map<String, Object> r = rpc.stats();
@@ -305,6 +316,18 @@ public class SpreaderReportEndpoint {
             kv(sb, "Resets", m.get("resets"));
             kv(sb, "Mean wait",
                     m.get("avgWaitMillis") + " ms (set by the slowest party)");
+            kv(sb, "Waiting now", m.get("waitingNow"));
+        }
+
+        if (exchanger != null) {
+            Map<String, Object> m = exchanger.stats();
+            title(sb, "Exchange points");
+            kv(sb, "Calls / exchanged / timeout", m.get("arrivals") + " / "
+                    + m.get("exchanges") + " / " + m.get("timeouts"));
+            kv(sb, "Pairings (leader only)", m.get("pairings"));
+            kv(sb, "Late / void", m.get("lateExchanges") + " / " + m.get("invalidations"));
+            kv(sb, "Mean wait",
+                    m.get("avgWaitMillis") + " ms (how long the second party took to arrive)");
             kv(sb, "Waiting now", m.get("waitingNow"));
         }
 
