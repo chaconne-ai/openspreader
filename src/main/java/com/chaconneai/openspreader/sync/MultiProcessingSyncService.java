@@ -28,18 +28,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Granularity, caching and argument validation -- everything about <i>how</i> to obtain
  * one -- are documented on the interface. This class adds two implementation trade-offs.
  *
- * <h2>Four tables, not one</h2>
- * Locks, latches, barriers and semaphores each get a cache table. Combined into one, a lock
- * and a latch under the same business name would displace each other -- and using one name
- * for different synchronisations of the same thing is a perfectly natural way to write it
- * ({@code import-batch} having both a latch and a lock for the closing work, say).
+ * <h2>Five tables, not one</h2>
+ * Locks, latches, barriers, semaphores and exchange points each get a cache table. Combined
+ * into one, a lock and a latch under the same business name would displace each other -- and
+ * using one name for different synchronisations of the same thing is a perfectly natural way
+ * to write it ({@code import-batch} having both a latch and a lock for the closing work,
+ * say).
  *
- * <h2>The four synchronisers have independent switches</h2>
- * Locks, latches, barriers and semaphores are <b>four independent settings</b>, and enabling
- * only one of them is ordinary usage. So a service is allowed to be {@code null} here, and
- * the error comes only when that kind of synchroniser is actually asked for -- naming the
- * setting to switch on -- rather than failing the entire application's configuration at
- * startup over a missing bean.
+ * <h2>The five synchronisers have independent switches</h2>
+ * Locks, latches, barriers, semaphores and exchange points are <b>five independent
+ * settings</b>, and enabling only one of them is ordinary usage. So a service is allowed to
+ * be {@code null} here, and the error comes only when that kind of synchroniser is actually
+ * asked for -- naming the setting to switch on -- rather than failing the entire
+ * application's configuration at startup over a missing bean.
  *
  * @author Fred Feng
  * @version 1.0.0
@@ -51,6 +52,7 @@ public class MultiProcessingSyncService implements ProcessingSyncService {
     private final LatchService latchService;
     private final BarrierService barrierService;
     private final SemaphoreService semaphoreService;
+    private final ExchangerService exchangerService;
     private final GossipCluster cluster;
 
     /** Qualified name -> instance. One table per kind, so the name spaces cannot interfere. */
@@ -58,20 +60,23 @@ public class MultiProcessingSyncService implements ProcessingSyncService {
     private final Map<String, ProcessingCountDownLatch> latches = new ConcurrentHashMap<>();
     private final Map<String, ProcessingCyclicBarrier> barriers = new ConcurrentHashMap<>();
     private final Map<String, ProcessingSemaphore> semaphores = new ConcurrentHashMap<>();
+    private final Map<String, ProcessingExchanger<?>> exchangers = new ConcurrentHashMap<>();
 
     /**
      * @param mutexService     the lock service; {@code null} when that feature is off
      * @param latchService     the latch service; {@code null} when that feature is off
      * @param barrierService   the barrier service; {@code null} when that feature is off
      * @param semaphoreService the semaphore service; {@code null} when that feature is off
+     * @param exchangerService the exchanger service; {@code null} when that feature is off
      */
     public MultiProcessingSyncService(MutexService mutexService, LatchService latchService,
                                BarrierService barrierService, SemaphoreService semaphoreService,
-                               GossipCluster cluster) {
+                               ExchangerService exchangerService, GossipCluster cluster) {
         this.mutexService = mutexService;
         this.latchService = latchService;
         this.barrierService = barrierService;
         this.semaphoreService = semaphoreService;
+        this.exchangerService = exchangerService;
         this.cluster = cluster;
     }
 
@@ -172,6 +177,26 @@ public class MultiProcessingSyncService implements ProcessingSyncService {
     }
 
     // ------------------------------------------------------------------
+    // Exchange points
+    // ------------------------------------------------------------------
+
+    /**
+     * <p>The cast is safe in the only sense available: {@code V} is erased before the item
+     * ever reaches the network, so this table cannot check it and nor could a table keyed by
+     * type. One name to one type is the caller's discipline; see
+     * {@link MultiProcessingExchanger}.
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <V> ProcessingExchanger<V> exchanger(Scope scope, String key) {
+        String name = qualify(scope, key, "exchange point name");
+        ExchangerService svc = require(exchangerService, "the cross-process exchanger",
+                "spring.spreader.multiprocessing.exchanger.enabled");
+        return (ProcessingExchanger<V>) exchangers.computeIfAbsent(name,
+                n -> new MultiProcessingExchanger<V>(svc, n));
+    }
+
+    // ------------------------------------------------------------------
     // Troubleshooting
     // ------------------------------------------------------------------
 
@@ -193,6 +218,11 @@ public class MultiProcessingSyncService implements ProcessingSyncService {
     @Override
     public Map<String, ProcessingCyclicBarrier> knownBarriers() {
         return Map.copyOf(barriers);
+    }
+
+    @Override
+    public Map<String, ProcessingExchanger<?>> knownExchangers() {
+        return Map.copyOf(exchangers);
     }
 
     // ------------------------------------------------------------------

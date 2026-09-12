@@ -6,8 +6,8 @@
 [![Maven Central](https://img.shields.io/badge/maven--central-1.0.0--SNAPSHOT-blue.svg)](https://central.sonatype.com/)
 
 **A complete set of multi-process programming components for Spring Boot:
-distributed locks, semaphores, latches and barriers, a process pool, a
-replicated cache, cluster-wide scheduling, RPC and MapReduce-style aggregation,
+distributed locks, semaphores, latches, barriers and exchangers, a process pool,
+a replicated cache, cluster-wide scheduling, RPC and MapReduce-style aggregation,
 all on top of the embedded [`spreader`](https://github.com/chaconne-ai/spreader) cluster.**
 
 Each component keeps the shape of its `java.util.concurrent` counterpart and
@@ -48,6 +48,7 @@ public class ReportService {
 | Distributed lock | `ProcessingSyncService.applicationMutex(key)` | `ReentrantLock` |
 | Semaphore | `ProcessingSyncService.applicationSemaphore(key, permits)` | `Semaphore` |
 | Latch / barrier | `ProcessingSyncService.applicationLatch/Barrier` | `CountDownLatch`, `CyclicBarrier` |
+| Exchanger | `ProcessingSyncService.applicationExchanger(key)` | `Exchanger` |
 | Replicated cache | `ProcessingCache` | a small Redis |
 | Process pool | `ProcessingPool`, or `@MultiProcessingCall` on any bean method | a work queue |
 | Cluster scheduling | `@MultiProcessingScheduled` | ShedLock |
@@ -61,6 +62,7 @@ public class ReportService {
 | **Reads never leave the process** | Every node holds a full replica of the cache, so a read is a local map lookup. Measured at over ten million bit tests per second against roughly two thousand cross-node writes per second. That gap is the design, and it says which workloads fit: read-heavy, tolerant of a few milliseconds of staleness. |
 | **The cache replicates operations, not data** | `setbit` on a 100MB bitmap ships one datagram, not the bitmap. That is what makes a cluster-wide Bloom filter practical rather than theoretical. |
 | **Two scopes for every component** | `application*` confines a lock, a semaphore or a latch to instances of the *same* application; `cluster*` spans everything sharing the cluster port. The choice is per call, not per deployment. |
+| **A rendezvous is not a transaction** | `ProcessingExchanger` pairs two parties and moves an item between them, but the item crosses the network through the leader. A change of leader mid-pairing loses it, which is why timing out returns the item rather than dropping it. Where an item must never be lost, use a queue with storage behind it. |
 | **The process pool tells you which side you are on** | A call runs locally when no peer is available and behaves exactly as before, so a single instance is a valid deployment. `spreader_pool_remote_ratio` says whether work is genuinely being spread or you have a local thread pool with extra steps. |
 | **Failures arrive as one exception type** | Everything surfaces as `ProcessingException`, split by cause rather than summed into a single rate, so a timeout and a serialization error never look alike on a dashboard. Business exceptions from your own remote code are passed through unwrapped. |
 | **Observability without extra work** | Metrics register with Micrometer and reach `/actuator/prometheus`; cluster health joins the actuator endpoints and carries each member's HTTP address, so one node's health response is enough to reach any other. |

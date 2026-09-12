@@ -19,6 +19,7 @@ import com.chaconneai.openspreader.MultiProcessingService;
 import com.chaconneai.openspreader.cache.CacheService;
 import com.chaconneai.openspreader.rpc.RpcService;
 import com.chaconneai.openspreader.sync.BarrierService;
+import com.chaconneai.openspreader.sync.ExchangerService;
 import com.chaconneai.openspreader.sync.LatchService;
 import com.chaconneai.openspreader.sync.SemaphoreService;
 import com.chaconneai.openspreader.pooling.PoolService;
@@ -97,6 +98,7 @@ public class ComponentMeterBinder implements MeterBinder {
     private final LatchService latch;
     private final BarrierService barrier;
     private final SemaphoreService semaphore;
+    private final ExchangerService exchanger;
     private final RpcService rpc;
 
     /** Task names already registered, so nothing is registered twice. */
@@ -110,17 +112,18 @@ public class ComponentMeterBinder implements MeterBinder {
      */
     public ComponentMeterBinder(CacheService cache, MutexService mutex,
                                 PoolService pool, MultiProcessingTaskStats scheduled) {
-        this(cache, mutex, pool, scheduled, null, null, null, null);
+        this(cache, mutex, pool, scheduled, null, null, null, null, null);
     }
 
     /**
-     * All eight components are <b>optional</b>, and one that is off is passed as {@code null};
+     * All nine components are <b>optional</b>, and one that is off is passed as {@code null};
      * see the note on the constructor above.
      */
     public ComponentMeterBinder(CacheService cache, MutexService mutex,
                                 PoolService pool, MultiProcessingTaskStats scheduled,
                                 LatchService latch, BarrierService barrier,
-                                SemaphoreService semaphore, RpcService rpc) {
+                                SemaphoreService semaphore, ExchangerService exchanger,
+                                RpcService rpc) {
         this.cache = cache;
         this.mutex = mutex;
         this.pool = pool;
@@ -128,6 +131,7 @@ public class ComponentMeterBinder implements MeterBinder {
         this.latch = latch;
         this.barrier = barrier;
         this.semaphore = semaphore;
+        this.exchanger = exchanger;
         this.rpc = rpc;
     }
 
@@ -153,6 +157,9 @@ public class ComponentMeterBinder implements MeterBinder {
         }
         if (semaphore != null) {
             bindSemaphore(registry);
+        }
+        if (exchanger != null) {
+            bindExchanger(registry);
         }
         if (rpc != null) {
             bindRpc(registry);
@@ -289,6 +296,44 @@ public class ComponentMeterBinder implements MeterBinder {
                 barrier, x -> statOf(barrier, "avgWaitMillis"));
         num(registry, "spreader.barrier.waiting", "waiters currently blocked",
                 barrier, x -> statOf(barrier, "waitingNow"));
+    }
+
+    // ------------------------------------------------------------------
+    // Exchange points
+    // ------------------------------------------------------------------
+
+    private void bindExchanger(MeterRegistry registry) {
+        num(registry, "spreader.exchanger.arrivals", "exchange calls in total",
+                exchanger, x -> statOf(exchanger, "arrivals"));
+        num(registry, "spreader.exchanger.exchanges", "calls that got an item back, in total",
+                exchanger, x -> statOf(exchanger, "exchanges"));
+        num(registry, "spreader.exchanger.pairings",
+                "pairings made while this node was the leader; one pairing serves two "
+                        + "exchanges, and a follower reports zero",
+                exchanger, x -> statOf(exchanger, "pairings"));
+        num(registry, "spreader.exchanger.timeouts",
+                "calls that ran out of time with no partner. The usual cause is one side of "
+                        + "the pairing never having been written",
+                exchanger, x -> statOf(exchanger, "timeouts"));
+        num(registry, "spreader.exchanger.failures",
+                "calls that left empty-handed for a reason other than a timeout: interrupted, "
+                        + "or the mechanism failed",
+                exchanger, x -> statOf(exchanger, "failures"));
+        num(registry, "spreader.exchanger.late",
+                "exchanges completed after their deadline because the pairing beat the "
+                        + "cancellation. Not an error, but a large number means the timeouts "
+                        + "are set close to the real waiting time",
+                exchanger, x -> statOf(exchanger, "lateExchanges"));
+        num(registry, "spreader.exchanger.invalidations",
+                "waits ended by a change of leader. Exchanges caught mid-pairing by one of "
+                        + "these are the ones that lose items",
+                exchanger, x -> statOf(exchanger, "invalidations"));
+        num(registry, "spreader.exchanger.wait.avg.millis",
+                "the mean wait of a successful exchange, which is how long the second party "
+                        + "took to turn up",
+                exchanger, x -> statOf(exchanger, "avgWaitMillis"));
+        num(registry, "spreader.exchanger.waiting", "parties currently blocked",
+                exchanger, x -> statOf(exchanger, "waitingNow"));
     }
 
     // ------------------------------------------------------------------

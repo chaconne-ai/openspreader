@@ -16,7 +16,11 @@
 package com.chaconneai.openspreader.sync;
 
 /**
- * The state a latch or barrier is currently in.
+ * The state a latch, barrier or exchange point is currently in.
+ *
+ * <p>The exchanger has a message of its own ({@link ExchangeMessage}, because it carries an
+ * item) but the same three states, so it reuses this enum rather than declaring a fourth
+ * copy of the identical thing.
  *
  * @author Fred Feng
  * @version 1.0.0
@@ -24,11 +28,12 @@ package com.chaconneai.openspreader.sync;
  */
 public enum SyncState {
 
-    /** Not satisfied yet: the latch has not reached zero, or the barrier is not full.
-     *  Keep waiting. */
+    /** Not satisfied yet: the latch has not reached zero, the barrier is not full, or no
+     *  partner has arrived at the exchange point. Keep waiting. */
     PENDING((byte) 0),
 
-    /** Satisfied: the latch reached zero, or this generation of the barrier was released. */
+    /** Satisfied: the latch reached zero, this generation of the barrier was released, or the
+     *  exchange paired. */
     SATISFIED((byte) 1),
 
     /**
@@ -39,6 +44,8 @@ public enum SyncState {
      *   <li>the barrier was broken -- a participant timed out, was interrupted, or left</li>
      *   <li>the leader changed -- the register lived in the old leader's memory and is gone</li>
      *   <li>an explicit reset</li>
+     *   <li>the exchange point no longer knows this party, because it was cancelled or the
+     *       register turned over</li>
      * </ul>
      * A waiter receiving this state must leave immediately and report an error. It
      * <b>must not</b> be treated as "keep waiting": the condition will never be satisfied

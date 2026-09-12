@@ -104,15 +104,16 @@ import java.util.function.Supplier;
  *   <tr><td>{@link #forCacheSync()}</td><td>Single-threaded</td>
  *       <td>It sends a full snapshot in chunks and may hold a thread for a long time</td></tr>
  *   <tr><td>{@link #forLatchNotify()}</td><td>Single-threaded</td>
- *       <td rowspan="2">Notification sends network messages and blocks. Sharing one thread,
+ *       <td rowspan="3">Notification sends network messages and blocks. Sharing one thread,
  *       one side stuck on a connect timeout stops the other entirely</td></tr>
  *   <tr><td>{@link #forBarrierNotify()}</td><td>Single-threaded</td></tr>
+ *   <tr><td>{@link #forExchangerNotify()}</td><td>Single-threaded</td></tr>
  *   <tr><td>{@link #forRecursiveTasks()}</td><td>ForkJoin</td>
  *       <td>A recursive task joins subtasks inside {@code compute()}, and only work-stealing
  *           avoids exhausting itself</td></tr>
  * </table>
  *
- * <p>The real answer for those last three single-threaded channels is <b>one shared bounded
+ * <p>The real answer for those last four single-threaded channels is <b>one shared bounded
  * pool with a serial lane per component</b>: the lane keeps a component's internal order, the
  * threads are shared, and there is no head-of-line blocking. That is the next step, and thanks
  * to the accessors above it will not affect any caller.
@@ -413,6 +414,12 @@ public class ExecutorServiceHolder implements InitializingBean, DisposableBean {
     public ExecutorService forBarrierNotify() {
         return pool("barrier-notify",
                 () -> ExecutorUtils.singleThread("barrier-notify", NOTIFIER_QUEUE));
+    }
+
+    /** Exchanger pairing notifications. */
+    public ExecutorService forExchangerNotify() {
+        return pool("exchanger-notify",
+                () -> ExecutorUtils.singleThread("exchanger-notify", NOTIFIER_QUEUE));
     }
 
     /**
