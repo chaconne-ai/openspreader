@@ -416,6 +416,29 @@ public class ExecutorServiceHolder implements InitializingBean, DisposableBean {
                 () -> ExecutorUtils.singleThread("barrier-notify", NOTIFIER_QUEUE));
     }
 
+    /**
+     * Runs DAG nodes marked as local, which is to say nodes whose work is a call to something
+     * outside this application.
+     *
+     * <p>Its own pool rather than the task-dispatch one, because these are <b>blocking I/O</b>
+     * by definition: an HTTP call to somebody else's service, holding a thread for as long as
+     * they take to answer. Sharing task dispatch's pool would let one slow third party stall
+     * the cluster's own work.
+     *
+     * <p>Sized off task dispatch's parallelism for want of a better signal, and generously:
+     * threads here are waiting on the network, not computing.
+     *
+     * <p><b>Rejecting, not discarding.</b> A discarded node would be a node the run waits for
+     * for ever, because the completion it is waiting on would simply never arrive. Rejecting
+     * turns a full queue into a failed node with a cause, which is the same choice the
+     * aggregation component makes and for the same reason.
+     */
+    public ExecutorService forDagLocal() {
+        return pool("dag-local",
+                () -> ExecutorUtils.rejecting("dag-local", Math.max(4, poolThreads * 2),
+                        POOL_INBOUND_QUEUE));
+    }
+
     /** Exchanger pairing notifications. */
     public ExecutorService forExchangerNotify() {
         return pool("exchanger-notify",

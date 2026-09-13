@@ -54,6 +54,7 @@ public class ReportService {
 | Cluster scheduling | `@MultiProcessingScheduled` | ShedLock |
 | RPC | `@RpcClient` | Feign for internal calls |
 | MapReduce | `ProcessingMapReduce`, or `@MultiProcessingMapReduce` | a batch framework, for jobs of this size |
+| DAG workflows | `ProcessingDag`, building a `StateGraph` | a workflow engine, for graphs of this size |
 
 ## What to expect in practice
 
@@ -90,6 +91,7 @@ public class ReportService {
 - [Quick start](#quick-start)
   - [The three annotations](#the-three-annotations)
   - [The cache](#the-cache)
+  - [Workflows: the DAG engine](#workflows-the-dag-engine)
 - [Performance](#performance-and-what-it-tells-you-about-the-design)
 - [Recommended configuration](#recommended-configuration)
 - [Observability](#observability)
@@ -265,6 +267,166 @@ filter.mightContain(phone);
 **It replicates operations, not data.** `setbit` on a 100MB bitmap ships one
 datagram. This is what makes a cluster-wide Bloom filter practical.
 
+### Workflows: the DAG engine
+
+Several steps, some of which depend on each other and some of which do not. Written by hand
+that becomes a tangle of futures, and the part that always goes wrong is not the happy path:
+it is what a conditional's unchosen branch does to a join further down.
+
+Turn it on with `spring.spreader.multiprocessing.dag.enabled=true`, on every instance, and
+describe the graph:
+
+```java
+CompiledGraph flow = dag.bind(StateGraph.create("order-flow")
+        .channel("trail", Reducers.concatList())     // how parallel writes merge
+        .input("orderId")                            // required at invoke time
+
+        .from(Validate.class).to(Charge.class)       // dependency
+        .from(Charge.class).to(Ship.class, Notify.class)   // fan-out, in parallel
+        .from(Ship.class, Notify.class).to(Settle.class)   // fan-in, waits for both
+
+        .from(Score.class)                           // conditional
+            .switchOn("#risk > 80 ? 'manual' : 'auto'")
+            .caseOf("manual", HumanReview.class)
+            .caseOf("auto", AutoApprove.class)
+
+        .from(Charge.class).onFailure().to(Refund.class)   // compensation
+        .retry(Charge.class, 2)                            // retried before that edge is taken
+
+        .entry(Validate.class)
+        .compile());
+
+RunResult result = flow.invoke(Map.of("orderId", id));
+```
+
+A node is an ordinary Spring bean extending `GraphNode`, returning the channels it wrote.
+Every node is dispatched through the process pool, so the steps of one workflow run on
+different instances, and a single instance is still a valid deployment.
+
+| | |
+|---|---|
+| **It builds nothing of its own** | Dispatch is the process pool, dynamic fan-out is `ProcessingMapReduce`, the reply cache that makes a retried dispatch safe is the pool's. The engine is the weaving |
+| **The graph is checked at `compile()`** | Cycles, unreachable nodes, an unreachable quorum, and two parallel branches writing one channel with no reducer declared, which is the one that would otherwise lose a write in silence |
+| **A skipped branch does not hang a join** | An unchosen branch is marked skipped and that propagates, so a fan-in downstream completes instead of waiting for something that will never arrive |
+| **Parallel merges are ordered by node name** | Not by arrival, so the same graph gives the same answer on a different day |
+| **A step can be a whole graph** | `SubGraph` is a node that is itself a graph, which is how a workflow stays readable past a dozen steps |
+| **A step can be outside this application** | `ExternalNode` plus `local(...)` calls an HTTP API from the coordinating instance rather than shipping the call to a peer |
+| **The definition can be stored** | `JsonRenderer` and `YamlRenderer` write a graph out and read it back, with a `GraphCatalog` supplying the node classes. Nothing is resolved by `Class.forName` |
+| **And drawn** | `flow.toMermaid()` for a README, `result.toMermaid()` for a finished run with each node coloured by what became of it |
+| **Persistence is the application's, and the seams are here** | Every run has an identity, every callback carries it, each node is reported as it finishes, and `resume(state, completed, runId)` carries on without re-running what already ran |
+
+#### The definition, stored and read back
+
+`flow.render()` writes the graph out; `load(text, catalog)` reads it back. This is
+`SettlementFlowBestPractice` verbatim, which is the shape a workflow takes in a database
+column:
+
+```json
+{
+  "graph": "daily-settlement",
+  "entries": ["LoadMerchants"],
+  "inputs": ["day", "dryRun"],
+  "channels": [
+    {"name": "steps", "reducer": "concatList"},
+    {"name": "payouts", "reducer": "writeOnce"},
+    {"name": "total", "reducer": "writeOnce"}
+  ],
+  "nodes": [
+    {"name": "LoadMerchants", "type": "com.acme.settlement.LoadMerchants", "kind": "node", "entry": true, "local": false, "trigger": "ALL", "retries": 0},
+    {"name": "ComputePayouts", "type": "com.acme.settlement.ComputePayouts", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
+    {"name": "Total", "type": "com.acme.settlement.Total", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
+    {"name": "TransferFunds", "type": "com.acme.settlement.TransferFunds", "kind": "node", "entry": false, "local": true, "trigger": "ALL", "retries": 2},
+    {"name": "ArchiveOnly", "type": "com.acme.settlement.ArchiveOnly", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
+    {"name": "FlagForOperator", "type": "com.acme.settlement.FlagForOperator", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
+    {"name": "Archive", "type": "com.acme.settlement.Archive", "kind": "node", "entry": false, "local": false, "trigger": "ANY", "retries": 0}
+  ],
+  "edges": [
+    {"from": "Total", "to": "TransferFunds", "kind": "conditional", "condition": "ON_SUCCESS", "branch": "0"},
+    {"from": "Total", "to": "ArchiveOnly", "kind": "conditional", "condition": "ON_SUCCESS", "branch": "else"},
+    {"from": "LoadMerchants", "to": "ComputePayouts", "kind": "plain", "condition": "ON_SUCCESS"},
+    {"from": "ComputePayouts", "to": "Total", "kind": "plain", "condition": "ON_SUCCESS"},
+    {"from": "TransferFunds", "to": "FlagForOperator", "kind": "plain", "condition": "ON_FAILURE"},
+    {"from": "TransferFunds", "to": "Archive", "kind": "plain", "condition": "ON_SUCCESS"},
+    {"from": "ArchiveOnly", "to": "Archive", "kind": "plain", "condition": "ON_SUCCESS"}
+  ],
+  "conditionals": [
+    {"sources": ["Total"], "form": "predicate", "expression": null,
+     "predicates": ["#total != null and #total > 0"],
+     "branches": [{"key": "0", "targets": ["TransferFunds"]}], "else": ["ArchiveOnly"]}
+  ]
+}
+```
+
+Four things in there are worth pointing out, because each answers a question people ask
+about the format:
+
+| | |
+|---|---|
+| **`retries`, `local` and `trigger` sit on the node** | They are properties of the step, not of an edge. `"retries": 2` is three attempts in all; `"local": true` is the bank call that runs on the coordinating instance; `"trigger": "ANY"` is the archive step firing on whichever branch got there first |
+| **`condition` is what the edge waits for** | `ON_SUCCESS` for the ordinary path, `ON_FAILURE` for the compensation edge. That one field is the whole of failure routing |
+| **The switches appear twice, deliberately** | Flattened into `edges` because drawing wants a flat list, and kept whole in `conditionals` because rebuilding wants the structure. A `when` chain stores its conditions as text and numbers its branches, hence `"branch": "0"` |
+| **The code is not in here** | `type` is a name the `GraphCatalog` looks up, never a `Class.forName`. Listeners are left out on purpose: they are a run-time concern, attached where the graph is used. A reducer or a condition written as a lambda has no text to store, and loading says so by name rather than handing back a graph quietly missing a rule |
+
+`RendererType.YAML` writes the same structure in a shape that diffs legibly in a pull
+request. Both read back.
+
+#### Persistence and resuming are the application's, and here is what it gets
+
+There is **no store and no scheduler in here**, by decision. This is a component package: it
+supplies the primitives, and where a half-finished run lives, how long it is kept and what
+wakes it up are answered by the application, which is the only part of the system that knows.
+
+What that decision obliges is the other half: the seams have to be real, or "the application
+does it" is not something an application can actually do. They are these.
+
+**Every run has an identity, and every callback carries it.** One listener instance sees
+every run of the graph, and two can be in flight at once, so without this a record built
+from callbacks would interleave them:
+
+```java
+RunResult r = flow.invoke(state, "settlement-2026-09-13");   // or let one be generated
+r.runId();                                                    // the same value
+```
+
+**Write each node down as it finishes.** `onTransition` reports edges, and a terminal node
+has none, so a record built from transitions alone is missing the last step of every branch.
+`onNodeFinished` reports the node:
+
+```java
+.listener(new GraphListener() {
+    @Override
+    public void onStart(String runId, CompiledGraph graph, GraphState initial) {
+        runs.open(runId, graph.render(), initial.asMap());     // the definition, as text
+    }
+
+    @Override
+    public void onNodeFinished(String runId, NodeOutcome outcome) {
+        runs.record(runId, outcome.node(), outcome.ok(), outcome.updates());
+    }
+})
+```
+
+**Hand it back to carry on.** Nodes named in `completed` are treated as done and are not
+dispatched, which on a step that has already moved money is the whole point:
+
+```java
+RunResult again = flow.resume(runs.stateOf(runId), runs.completedIn(runId), runId);
+```
+
+`RunResult.state()` and `RunResult.completed()` are shaped to be stored and handed back
+unchanged. Three things about `resume` are worth knowing before relying on it:
+
+| | |
+|---|---|
+| **A skipped node is not in `completed()`** | A skip is worked out, not something that happened. Storing one and restoring it would freeze it: a step skipped because the run failed above it would stay skipped after the failure was fixed, and the resumed run would finish having done nothing while looking healthy. Left out, it is recomputed, and a conditional on a restored node is evaluated again and passes over the same branch |
+| **A failed node is** | As FAILED, so resuming carries on down the compensation path exactly as the first run did. Removing it from the map first is how you say "try that step again" |
+| **A node interrupted mid-flight runs again** | It never finished, so it is not in the record. Whether that is safe is the question `retry(...)` asks, with the same answer: make the node idempotent, or key the outside call on something derived rather than generated |
+
+**Waiting, timers and human steps** are the same answer in a different shape, and they do
+not need an API here: cut the graph in two, and let whatever knows when to continue (a
+scheduler, a queue, a callback endpoint) resume the second half. A node that blocks waiting
+for a person would hold a pool thread for as long as the person took.
+
 ## Performance, and what it tells you about the design
 
 Single JVM, loopback. **Absolute numbers will not transfer to your hardware**;
@@ -360,6 +522,9 @@ spring.spreader.advertise-host=10.0.1.10          # in containers: what peers ca
 spring.spreader.multiprocessing.mutex.enabled=true
 spring.spreader.multiprocessing.cache.enabled=true
 spring.spreader.multiprocessing.scheduling.enabled=true
+# the DAG engine needs this set on every instance, since every one of them
+# has to be able to run a node it is handed
+spring.spreader.multiprocessing.dag.enabled=true
 
 # --- cache ---
 spring.spreader.multiprocessing.cache.max-keys=1000000
@@ -612,6 +777,10 @@ Runnable, and covered by tests, in `com.chaconneai.openspreader.example`:
 | `PhoneDedupBestPractice` | deduplication at scale |
 | `MethodDispatchBestPractice` | `@MultiProcessingCall` and recursive tasks |
 | `ScheduledTaskBestPractice` | `@MultiProcessingScheduled` patterns |
+| `MapReduceBestPractice` | splitting a job, and jobs worth splitting |
+| `ExchangerBestPractice` | handing an item between two parties |
+| `OrderFlowBestPractice` | the DAG engine's five shapes in one order workflow |
+| `SettlementFlowBestPractice` | a DAG with retries, compensation, a bank call and a sharded batch |
 
 These are tested, not illustrative. The tests exist because example code fails
 in a particular way: it is off the main path, so a change that alters its

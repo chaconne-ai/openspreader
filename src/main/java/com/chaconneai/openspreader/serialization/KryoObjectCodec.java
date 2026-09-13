@@ -18,11 +18,23 @@ package com.chaconneai.openspreader.serialization;
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
+import com.esotericsoftware.kryo.serializers.JavaSerializer;
 import com.esotericsoftware.kryo.util.DefaultInstantiatorStrategy;
 import com.esotericsoftware.kryo.util.Pool;
 import org.objenesis.strategy.StdInstantiatorStrategy;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Kryo serialisation. The smallest and the fastest of the options.
@@ -109,9 +121,58 @@ public class KryoObjectCodec implements ObjectCodec {
                 // Falls back to Objenesis without a no-argument constructor; see the class documentation
                 kryo.setInstantiatorStrategy(
                         new DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));
+                useJavaSerialisationFor(kryo);
                 return kryo;
             }
         };
+    }
+
+
+    /**
+     * Hands a few shapes back to JDK serialisation, because Kryo rebuilds them wrongly.
+     *
+     * <p>Kryo's own map and collection serialisers work by <b>creating an empty instance and
+     * adding to it</b>. That cannot work for anything unmodifiable: the instance is created
+     * and the first add throws. Kryo cannot rebuild a {@link Throwable} either, whose state
+     * lives in fields the JVM fills in.
+     *
+     * <p>Both shapes are ordinary in a payload rather than exotic, which is what makes this
+     * worth doing. A pooled method returning {@code Map.of(...)} or a collection wrapped in
+     * {@code Collections.unmodifiableList} is idiomatic Java; so is a task whose result
+     * carries the exception it caught. Every one of them failed under Kryo and worked under
+     * JDK serialisation, which is precisely the kind of difference that has someone change
+     * one configuration line and meet a bug in production.
+     *
+     * <p>They are all {@link java.io.Serializable}, so Kryo's own {@code JavaSerializer}
+     * handles them correctly. It is slower than Kryo's native path, and that is the right
+     * trade: these are small parts of a payload, and correct beats fast.
+     *
+     * <p>Registered from sample instances rather than by class name, because the classes are
+     * package-private JDK internals whose names are not a stable interface.
+     */
+    private static void useJavaSerialisationFor(Kryo kryo) {
+        // Anything that throws when something is added to it
+        Object[] samples = {
+                Collections.unmodifiableCollection(new ArrayList<>()),
+                Collections.unmodifiableList(new ArrayList<>()),
+                Collections.unmodifiableList(new LinkedList<>()),
+                Collections.unmodifiableSet(new HashSet<>()),
+                Collections.unmodifiableSortedSet(new TreeSet<>()),
+                Collections.unmodifiableMap(new HashMap<>()),
+                Collections.unmodifiableSortedMap(new TreeMap<>()),
+                Collections.emptyList(), Collections.emptySet(), Collections.emptyMap(),
+                Collections.singletonList(""), Collections.singleton(""),
+                Collections.singletonMap("", ""),
+                Arrays.asList("", ""),
+                List.of(), List.of(""), List.of("", "", ""),
+                Set.of(), Set.of(""), Set.of("", "x", "y"),
+                Map.of(), Map.of("", ""), Map.of("", "", "x", "y", "z", "w")
+        };
+        for (Object sample : samples) {
+            kryo.addDefaultSerializer(sample.getClass(), JavaSerializer.class);
+        }
+        // Subclasses included, so an application's own exception type is covered too
+        kryo.addDefaultSerializer(Throwable.class, JavaSerializer.class);
     }
 
     @Override
