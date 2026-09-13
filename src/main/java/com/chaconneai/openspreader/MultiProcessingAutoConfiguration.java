@@ -22,6 +22,11 @@ import com.chaconneai.openspreader.cache.CacheService;
 import java.nio.file.Path;
 import com.chaconneai.openspreader.cache.ProcessingCache;
 import com.chaconneai.openspreader.cache.MultiProcessingCache;
+import com.chaconneai.openspreader.dag.MultiProcessingDag;
+import com.chaconneai.openspreader.dag.GraphNode;
+import com.chaconneai.openspreader.dag.ProcessingDag;
+import com.chaconneai.openspreader.dag.DagRuntime;
+import com.chaconneai.openspreader.dag.NodeDispatcher;
 import com.chaconneai.openspreader.sync.BarrierService;
 import com.chaconneai.openspreader.sync.ExchangerService;
 import com.chaconneai.openspreader.sync.LatchService;
@@ -61,7 +66,8 @@ import org.springframework.scheduling.TaskScheduler;
 
 /**
  * Auto-configuration for the multi-processing toolkit: locks, semaphores, latches, barriers,
- * exchange points, scheduled-task exclusion, the process pool, and the cluster cache.
+ * exchange points, scheduled-task exclusion, the process pool, the cluster cache and the DAG
+ * engine.
  *
  * <p>All of it is built on {@link GossipCluster}, so it comes after
  * {@link ApplicationClusterAutoConfiguration}, which brings the cluster up. Without a cluster
@@ -218,6 +224,59 @@ public class MultiProcessingAutoConfiguration {
         return new MultiProcessingSyncService(mutexService.getIfAvailable(), latchService.getIfAvailable(),
                 barrierService.getIfAvailable(), semaphoreService.getIfAvailable(),
                 exchangerService.getIfAvailable(), cluster);
+    }
+
+    // ------------------------------------------------------------------
+    // The DAG engine
+    // ------------------------------------------------------------------
+
+    /**
+     * The one method the cluster is allowed to call for a graph node.
+     *
+     * <p>Registered under a fixed bean name because the engine dispatches to it by name; see
+     * {@link NodeDispatcher#BEAN_NAME}. Every replica needs this bean, which is why the
+     * property that creates it has to be set everywhere.
+     *
+     * <p>Node beans are injected through {@link ObjectProvider} rather than by constructor
+     * list: a {@code GraphNode} is an ordinary bean with ordinary dependencies, and forcing
+     * them all to exist while this configuration is being built would make the engine part of
+     * every node's startup order.
+     */
+    @Bean(name = NodeDispatcher.BEAN_NAME)
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.dag", name = "enabled",
+            havingValue = "true", matchIfMissing = false)
+    public NodeDispatcher dagNodeDispatcher(ObjectProvider<GraphNode> nodes,
+            GossipCluster cluster) {
+        return new NodeDispatcher(nodes.orderedStream().toList(), cluster.self().label());
+    }
+
+    /**
+     * The DAG engine.
+     *
+     * <p>It borrows exactly one thing, the process pool, so it is conditional on that rather
+     * than on the cluster: a graph with nowhere to dispatch its nodes is not an engine.
+     *
+     * <p>The plain pool rather than the fork/join one, and the choice does not matter: both
+     * facades delegate {@code submit(className, beanName, method, args)} to the same
+     * {@code PoolService} call, and fork/join only adds the recursive-task overload, which
+     * this engine does not use. It is named explicitly because there are two
+     * {@code ProcessingPool} beans and injecting by the interface would be ambiguous.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.dag", name = "enabled",
+            havingValue = "true", matchIfMissing = false)
+    public ProcessingDag processingDag(MultiProcessingPool pool, NodeDispatcher dispatcher,
+            ExecutorServiceHolder executors, MultiProcessingProperties props) {
+        MultiProcessingProperties.Dag dag = props.getDag();
+        log.info("DAG engine started: default run timeout={}",
+                dag.getDefaultTimeoutMs() == 0 ? "none" : dag.getDefaultTimeoutMs() + "ms");
+        // The dispatcher is passed in twice over, so to speak: peers reach it through the
+        // pool, and nodes declared local() are handed to it directly on this instance
+        return new MultiProcessingDag(
+                new DagRuntime(pool, dispatcher, executors.forDagLocal()),
+                dag.getDefaultTimeoutMs());
     }
 
     /**

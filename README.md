@@ -54,6 +54,7 @@ public class ReportService {
 | Cluster scheduling | `@MultiProcessingScheduled` | ShedLock |
 | RPC | `@RpcClient` | Feign for internal calls |
 | MapReduce | `ProcessingMapReduce`, or `@MultiProcessingMapReduce` | a batch framework, for jobs of this size |
+| DAG workflows | `ProcessingDag`, building a `StateGraph` | a workflow engine, for graphs of this size |
 
 ## What to expect in practice
 
@@ -90,6 +91,7 @@ public class ReportService {
 - [Quick start](#quick-start)
   - [The three annotations](#the-three-annotations)
   - [The cache](#the-cache)
+  - [Workflows: the DAG engine](#workflows-the-dag-engine)
 - [Performance](#performance-and-what-it-tells-you-about-the-design)
 - [Recommended configuration](#recommended-configuration)
 - [Observability](#observability)
@@ -265,6 +267,53 @@ filter.mightContain(phone);
 **It replicates operations, not data.** `setbit` on a 100MB bitmap ships one
 datagram. This is what makes a cluster-wide Bloom filter practical.
 
+### Workflows: the DAG engine
+
+Several steps, some of which depend on each other and some of which do not. Written by hand
+that becomes a tangle of futures, and the part that always goes wrong is not the happy path:
+it is what a conditional's unchosen branch does to a join further down.
+
+Turn it on with `spring.spreader.multiprocessing.dag.enabled=true`, on every instance, and
+describe the graph:
+
+```java
+CompiledGraph flow = dag.bind(StateGraph.create("order-flow")
+        .channel("trail", Reducers.concatList())     // how parallel writes merge
+        .input("orderId")                            // required at invoke time
+
+        .from(Validate.class).to(Charge.class)       // dependency
+        .from(Charge.class).to(Ship.class, Notify.class)   // fan-out, in parallel
+        .from(Ship.class, Notify.class).to(Settle.class)   // fan-in, waits for both
+
+        .from(Score.class)                           // conditional
+            .switchOn("#risk > 80 ? 'manual' : 'auto'")
+            .caseOf("manual", HumanReview.class)
+            .caseOf("auto", AutoApprove.class)
+
+        .from(Charge.class).onFailure().to(Refund.class)   // compensation
+        .retry(Charge.class, 2)                            // retried before that edge is taken
+
+        .entry(Validate.class)
+        .compile());
+
+RunResult result = flow.invoke(Map.of("orderId", id));
+```
+
+A node is an ordinary Spring bean extending `GraphNode`, returning the channels it wrote.
+Every node is dispatched through the process pool, so the steps of one workflow run on
+different instances, and a single instance is still a valid deployment.
+
+| | |
+|---|---|
+| **It builds nothing of its own** | Dispatch is the process pool, dynamic fan-out is `ProcessingMapReduce`, the reply cache that makes a retried dispatch safe is the pool's. The engine is the weaving |
+| **The graph is checked at `compile()`** | Cycles, unreachable nodes, an unreachable quorum, and two parallel branches writing one channel with no reducer declared, which is the one that would otherwise lose a write in silence |
+| **A skipped branch does not hang a join** | An unchosen branch is marked skipped and that propagates, so a fan-in downstream completes instead of waiting for something that will never arrive |
+| **Parallel merges are ordered by node name** | Not by arrival, so the same graph gives the same answer on a different day |
+| **A step can be a whole graph** | `SubGraph` is a node that is itself a graph, which is how a workflow stays readable past a dozen steps |
+| **A step can be outside this application** | `ExternalNode` plus `local(...)` calls an HTTP API from the coordinating instance rather than shipping the call to a peer |
+| **The definition can be stored** | `JsonRenderer` and `YamlRenderer` write a graph out and read it back, with a `GraphCatalog` supplying the node classes. Nothing is resolved by `Class.forName` |
+| **And drawn** | `flow.toMermaid()` for a README, `result.toMermaid()` for a finished run with each node coloured by what became of it |
+
 ## Performance, and what it tells you about the design
 
 Single JVM, loopback. **Absolute numbers will not transfer to your hardware**;
@@ -360,6 +409,9 @@ spring.spreader.advertise-host=10.0.1.10          # in containers: what peers ca
 spring.spreader.multiprocessing.mutex.enabled=true
 spring.spreader.multiprocessing.cache.enabled=true
 spring.spreader.multiprocessing.scheduling.enabled=true
+# the DAG engine needs this set on every instance, since every one of them
+# has to be able to run a node it is handed
+spring.spreader.multiprocessing.dag.enabled=true
 
 # --- cache ---
 spring.spreader.multiprocessing.cache.max-keys=1000000

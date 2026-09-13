@@ -30,8 +30,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * {@code spring.spreader.multiprocessing}.
  *
  * <p>It covers only the tools built on top of the cluster: locks, semaphores, latches,
- * barriers, exchange points, scheduled-task exclusion, the process pool and the cluster
- * cache. <b>The cluster
+ * barriers, exchange points, scheduled-task exclusion, the process pool, the cluster
+ * cache and the DAG engine. <b>The cluster
  * itself</b> -- its name, port, discovery, transport and timeouts -- lives under
  * {@code spring.spreader.*}; see {@link ApplicationClusterProperties}.
  *
@@ -80,6 +80,8 @@ public class MultiProcessingProperties {
     private Barrier barrier = new Barrier();
 
     private Exchanger exchanger = new Exchanger();
+
+    private Dag dag = new Dag();
 
     private Rpc rpc = new Rpc();
 
@@ -331,6 +333,40 @@ public class MultiProcessingProperties {
          * pins an item in the leader's memory for that long.
          */
         private long idleTimeoutMs = 300_000L;
+    }
+
+    /**
+     * The DAG engine's configuration.
+     *
+     * <p>There is very little, and that is on purpose. A graph carries its own shape, its own
+     * channels and its own conditions, all in code where they can be read and tested. Anything
+     * put here would be a second place to look.
+     */
+    @Data
+    public static class Dag {
+
+        /**
+         * Whether the engine is enabled.
+         *
+         * <p><b>It has to be on for every replica</b>, not only the one that starts a run. A
+         * replica with it off has no node dispatcher, so work sent to it comes back refused.
+         * Half a cluster configured is worse than none, because it works until a dispatch
+         * happens to land on the wrong instance.
+         */
+        private boolean enabled = false;
+
+        /**
+         * How long a whole run may take, in milliseconds. 0 waits indefinitely.
+         *
+         * <p>It is the ceiling on the run, not on a node: a graph of ten slow nodes needs the
+         * sum of them. A run that overruns comes back with whatever finished and a failure
+         * saying so, rather than throwing away the part that worked.
+         *
+         * <p>Waiting for ever is the default because a graph's natural duration is the
+         * application's business, and a number invented here would be wrong for somebody.
+         * {@code CompiledGraph.invoke(state, timeout, unit)} overrides it per run.
+         */
+        private long defaultTimeoutMs = 0L;
     }
 
     /** The distributed lock's configuration. */
