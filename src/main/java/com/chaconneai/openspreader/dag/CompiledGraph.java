@@ -27,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -254,6 +255,86 @@ public class CompiledGraph {
      *                than none
      */
     public RunResult invoke(GraphState initial, long timeout, TimeUnit unit) {
+        return start(initial, Map.of(), newRunId(), timeout, unit);
+    }
+
+    /**
+     * Runs the graph under an identity of your choosing.
+     *
+     * <p>For an application that keeps its own record of runs: pass the key it files things
+     * under, and every {@link GraphListener} callback carries it, as does
+     * {@link RunResult#runId()}. Without one, an identity is generated, which is fine when
+     * nothing outside is keeping track.
+     *
+     * <p>Note what this is <b>not</b>: it is not a deduplication key. Invoking twice with the
+     * same id runs the graph twice. Whether a run should happen at all is a question about
+     * the application's records, and answering it here would mean this engine keeping records
+     * of its own, which it deliberately does not.
+     */
+    public RunResult invoke(GraphState initial, String runId) {
+        return start(initial, Map.of(), requireRunId(runId), 0L, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Carries on where an earlier run stopped, instead of starting over.
+     *
+     * <pre>{@code
+     * // as the first run proceeds, the application writes each node away
+     * .listener(new GraphListener() {
+     *     public void onNodeFinished(String runId, NodeOutcome outcome) {
+     *         runs.record(runId, outcome.node(), outcome.ok(), outcome.updates());
+     *     }
+     * })
+     *
+     * // later, after whatever went wrong
+     * RunResult again = flow.resume(runs.stateOf(runId), runs.completedIn(runId), runId);
+     * }</pre>
+     *
+     * <p><b>Every node in {@code completed} is treated as done and is not dispatched.</b>
+     * That is the point of it: a step that has already charged a card must not charge it
+     * again because the coordinating instance died afterwards. Everything else is worked out
+     * from there, exactly as in a fresh run: which edges carry, which branches are skipped,
+     * what is ready next.
+     *
+     * <p><b>What this engine does not do is keep the record.</b> There is no store here and
+     * no scheduler; the state and the statuses come from the application, which is the only
+     * part of the system that knows where its data lives and how long a half-finished run is
+     * worth keeping. {@link RunResult#state()} and {@link RunResult#completed()} are shaped
+     * to be written down and handed back.
+     *
+     * <p>Two things to know before relying on it:
+     * <ul>
+     *   <li>a conditional on a restored node is <b>evaluated again</b> against the restored
+     *       state. A condition written as SpEL is a pure function of the channels and gives
+     *       the same branch; a lambda reading something else might not;</li>
+     *   <li>a node interrupted <b>mid-flight</b> was never finished, so it is not in
+     *       {@code completed} and it runs again. Whether that is safe is the same question
+     *       {@code retry(...)} asks, and it has the same answer: make the node idempotent.</li>
+     * </ul>
+     *
+     * @param state     the channels as they stood, typically {@link RunResult#state()} as
+     *                  stored
+     * @param completed what had finished, typically {@link RunResult#completed()} as stored
+     * @throws DagException naming a node the graph does not have, or a status that is not a
+     *                      finished one
+     */
+    public RunResult resume(GraphState state, Map<String, NodeStatus> completed) {
+        return resume(state, completed, newRunId());
+    }
+
+    /** The same, under the identity the earlier run had. */
+    public RunResult resume(GraphState state, Map<String, NodeStatus> completed, String runId) {
+        return resume(state, completed, runId, 0L, TimeUnit.MILLISECONDS);
+    }
+
+    /** The same, with a ceiling on what remains. */
+    public RunResult resume(GraphState state, Map<String, NodeStatus> completed, String runId,
+                            long timeout, TimeUnit unit) {
+        return start(state, validateCompleted(completed), requireRunId(runId), timeout, unit);
+    }
+
+    private RunResult start(GraphState initial, Map<String, NodeStatus> completed, String runId,
+                            long timeout, TimeUnit unit) {
         // Inputs first, and deliberately: checking them is a pure function of the graph and
         // the arguments, so it needs no runtime and a graph compiled purely for validation can
         // still be checked against a set of arguments. It is also the mistake more likely to
@@ -266,7 +347,51 @@ public class CompiledGraph {
                     + "withRuntime(...) when using this outside Spring");
         }
         return new GraphRunner(this, runtime)
-                .run(prepared, unit.toMillis(Math.max(0L, timeout)));
+                .run(prepared, completed, runId, unit.toMillis(Math.max(0L, timeout)));
+    }
+
+    /**
+     * Checks what a caller says has already finished.
+     *
+     * <p>Both refusals are worth making loudly. A node the graph does not have is a stored
+     * record that no longer matches the definition, which happens the first time somebody
+     * renames a node and finds the old runs still in the table. A status of PENDING or
+     * RUNNING means "it had not finished", and treating that as finished would skip a step
+     * that never ran.
+     */
+    private Map<String, NodeStatus> validateCompleted(Map<String, NodeStatus> completed) {
+        if (completed == null || completed.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, NodeStatus> checked = new LinkedHashMap<>();
+        for (Map.Entry<String, NodeStatus> entry : completed.entrySet()) {
+            String node = entry.getKey();
+            if (!nodes.containsKey(node)) {
+                throw new DagException("cannot resume graph " + name + ": it has no node \""
+                        + node + "\". Its nodes are " + nodes.keySet() + ". A stored run "
+                        + "whose nodes no longer match the graph cannot be carried on");
+            }
+            NodeStatus was = entry.getValue();
+            if (was == null || was == NodeStatus.PENDING || was == NodeStatus.RUNNING) {
+                throw new DagException("cannot resume graph " + name + ": node \"" + node
+                        + "\" is given as " + was + ", which is not a finished state. Only "
+                        + "SUCCESS, FAILED or SKIPPED can be taken back");
+            }
+            checked.put(node, was);
+        }
+        return Map.copyOf(checked);
+    }
+
+    private static String newRunId() {
+        return UUID.randomUUID().toString();
+    }
+
+    private static String requireRunId(String runId) {
+        if (runId == null || runId.isBlank()) {
+            throw new IllegalArgumentException("a run id must not be blank; use the overload "
+                    + "without one to have it generated");
+        }
+        return runId;
     }
 
     // ------------------------------------------------------------------

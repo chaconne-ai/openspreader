@@ -25,7 +25,7 @@ package com.chaconneai.openspreader.dag;
  * flow = dag.bind(StateGraph.create("order-flow")
  *         .listener(new GraphListener() {
  *             @Override
- *             public void onTransition(String from, String to, GraphState state) {
+ *             public void onTransition(String runId, String from, String to, GraphState s) {
  *                 tracer.currentSpan().event(from + " -> " + to);
  *             }
  *
@@ -37,6 +37,13 @@ package com.chaconneai.openspreader.dag;
  *         ...
  *         .compile());
  * }</pre>
+ *
+ * <h2>Every callback carries the run's identity</h2>
+ * A listener is attached to the <b>graph</b>, so one instance sees every run of it, and two
+ * runs can be in flight at once. Without the {@code runId} on each call, a listener building
+ * a record would interleave them and there would be no way to tell afterwards. It is the same
+ * identity {@link RunResult#runId()} reports, so what a listener wrote and what the caller
+ * got back line up.
  *
  * <h2>Not to be confused with the failure edge</h2>
  * {@link #onFailure} here is an <b>observer</b>: it is told, and changes nothing.
@@ -66,12 +73,44 @@ public interface GraphListener {
      * fan-in of three is three calls. Edges that did not carry, a conditional's unchosen
      * branches among them, are not reported here; {@code RunResult.statuses()} has them.
      *
+     * @param runId this run's identity, the same one {@link RunResult#runId()} carries
      * @param from  the node that finished
      * @param to    the node this edge leads to. It may not have started yet, and with
      *              {@code Trigger.all()} it may still be waiting on other edges
      * @param state the channels as they stood when the edge resolved
      */
-    default void onTransition(String from, String to, GraphState state) {
+    default void onTransition(String runId, String from, String to, GraphState state) {
+    }
+
+    /**
+     * The run is about to start.
+     *
+     * <p>Where an application that keeps its own record writes the opening entry: the run's
+     * identity, the definition it is running, and what it was given.
+     *
+     * @param graph   the graph, whose {@code render()} is the definition as text
+     * @param initial the channels the caller supplied, after the declared inputs have been
+     *                checked and the optional ones filled in
+     */
+    default void onStart(String runId, CompiledGraph graph, GraphState initial) {
+    }
+
+    /**
+     * One node finished, for good: it succeeded, or it failed with its retries used up.
+     *
+     * <p><b>This is the hook to persist against.</b> {@link #onTransition} reports edges, and
+     * a node with no outgoing edge produces none, so a record built from transitions alone
+     * would be missing every terminal node. This one reports the node itself, with what it
+     * wrote and where it ran.
+     *
+     * <p>Writing {@code (runId, outcome.node(), status, outcome.updates())} away as it
+     * arrives is what makes {@code CompiledGraph.resume(...)} usable later: those rows are
+     * exactly what it takes back.
+     *
+     * <p>A node being retried is <b>not</b> reported here; {@link #onRetry} is. So one node
+     * produces exactly one of these per run.
+     */
+    default void onNodeFinished(String runId, NodeOutcome outcome) {
     }
 
     /**
@@ -104,6 +143,6 @@ public interface GraphListener {
      * @param attempt the attempt about to start, counting the first as 1
      * @param cause   what the previous attempt threw
      */
-    default void onRetry(String node, int attempt, Throwable cause) {
+    default void onRetry(String runId, String node, int attempt, Throwable cause) {
     }
 }

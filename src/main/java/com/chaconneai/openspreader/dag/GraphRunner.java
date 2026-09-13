@@ -119,6 +119,7 @@ public class GraphRunner {
     private final Set<String> dispatched = new LinkedHashSet<>();
 
     private GraphState state = GraphState.empty();
+    private String runId;
     private int inflight;
     private String failedNode;
     private Throwable failure;
@@ -147,8 +148,23 @@ public class GraphRunner {
      * @param timeoutMs 0 or less waits indefinitely
      */
     public RunResult run(GraphState initial, long timeoutMs) {
+        return run(initial, Map.of(), java.util.UUID.randomUUID().toString(), timeoutMs);
+    }
+
+    /**
+     * Runs to completion, optionally carrying on from where an earlier run stopped.
+     *
+     * @param completed nodes that have already finished and must not run again, with what
+     *                  became of each. Empty for a fresh run
+     * @param runId     this run's identity, carried on every listener callback and on the
+     *                  result
+     * @param timeoutMs 0 or less waits indefinitely
+     */
+    public RunResult run(GraphState initial, Map<String, NodeStatus> completed, String runId,
+                         long timeoutMs) {
         long startedAt = System.currentTimeMillis();
         this.state = initial == null ? GraphState.empty() : initial;
+        this.runId = runId;
 
         for (String node : graph.nodeNames()) {
             status.put(node, NodeStatus.PENDING);
@@ -157,9 +173,20 @@ public class GraphRunner {
             edgeStates.put(node, out);
         }
 
+        restore(completed);
+        notify(l -> l.onStart(runId, graph, state));
+
         // Every root at once. Two independent roots run in parallel with no edge between
-        // them, which is the reason multiple entries exist at all
+        // them, which is the reason multiple entries exist at all. A root that is already
+        // done is skipped: dispatch() refuses a node that has been dispatched before, and
+        // restore() put every finished node into that set
         graph.entries().forEach(this::dispatch);
+
+        if (!completed.isEmpty()) {
+            // Whatever the restored statuses have made ready. A fresh run reaches this
+            // through the first completions instead
+            cascade();
+        }
 
         long deadline = timeoutMs > 0 ? startedAt + timeoutMs : Long.MAX_VALUE;
         while (inflight > 0) {
@@ -192,8 +219,8 @@ public class GraphRunner {
         // held back for ordering any longer
         drainRemaining();
 
-        RunResult result = RunResult.of(graph, state, status, outcomes, failedNode, failure,
-                failures, System.currentTimeMillis() - startedAt);
+        RunResult result = RunResult.of(runId, graph, state, status, outcomes, failedNode,
+                failure, failures, System.currentTimeMillis() - startedAt);
         // A run whose failure was routed to a compensation path arrives at onSuccess: it did
         // what the graph said to do. result.failures() is how a listener tells the two apart
         notify(l -> {
@@ -204,6 +231,57 @@ public class GraphRunner {
             }
         });
         return result;
+    }
+
+    /**
+     * Takes back what an earlier run finished, so that this one carries on rather than
+     * starting over.
+     *
+     * <p>Three things happen for each restored node, and all three are needed:
+     * <ol>
+     *   <li>its status is set, so the readiness of everything downstream is judged against
+     *       it;</li>
+     *   <li>it joins the dispatched set, which is what stops it running a second time. This
+     *       is the whole point: re-running a step that has already moved money is worse than
+     *       not resuming at all;</li>
+     *   <li>its outbound edges are resolved, <b>without announcing them</b>. Those
+     *       transitions were reported when they first happened, and reporting them again
+     *       would have an application's record show the same move twice.</li>
+     * </ol>
+     *
+     * <p>A conditional on a restored node is <b>evaluated again</b> against the restored
+     * state rather than being stored. For an expression that is a pure function of the
+     * channels, which is what SpEL conditions are, that gives the same branch. A router
+     * written as a lambda reading something outside the state could differ, and then so
+     * would the run, which is one more reason to write conditions as expressions.
+     */
+    private void restore(Map<String, NodeStatus> completed) {
+        if (completed.isEmpty()) {
+            return;
+        }
+        completed.forEach((node, was) -> {
+            status.put(node, was);
+            dispatched.add(node);
+            if (was == NodeStatus.FAILED) {
+                failures.put(node, new DagException("node " + node + " had already failed "
+                        + "when this run was resumed"));
+            }
+        });
+
+        // Every status is in place before any edge is resolved, so a router reads the whole
+        // restored state rather than half of it
+        for (String node : completed.keySet()) {
+            resolveOutgoing(node, false);
+        }
+        for (Map.Entry<String, NodeStatus> entry : completed.entrySet()) {
+            if (entry.getValue() == NodeStatus.FAILED && !tolerated(entry.getKey())
+                    && failedNode == null) {
+                // The same judgement a fresh run would have made: a failure the graph has no
+                // plan for stops the run, resumed or not
+                failedNode = entry.getKey();
+                failure = failures.get(entry.getKey());
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -230,7 +308,7 @@ public class GraphRunner {
                 attempts.put(node, next);
                 log.debug("Graph {} node {} failed, retrying (attempt {} of {}): {}",
                         graph.name(), node, next, graph.retriesOf(node) + 1, thrown.toString());
-                notify(l -> l.onRetry(node, next, thrown));
+                notify(l -> l.onRetry(runId, node, next, thrown));
                 // The pool picks a replica afresh on every call, so the next attempt may well
                 // land somewhere else. That is what makes retrying worth anything against
                 // "one instance is unwell"
@@ -242,6 +320,7 @@ public class GraphRunner {
 
             status.put(node, NodeStatus.FAILED);
             failures.put(node, thrown);
+            notify(l -> l.onNodeFinished(runId, outcome));
 
             // The edges have to be resolved before it can be said whether this failure
             // actually cost anything; see tolerated()
@@ -256,6 +335,7 @@ public class GraphRunner {
 
         // Which edges carry is decided by each edge's condition against what became of the
         // node, rather than by success alone
+        notify(l -> l.onNodeFinished(runId, outcome));
         resolveOutgoing(node);
         cascade();
     }
@@ -268,6 +348,10 @@ public class GraphRunner {
      * two branches of one switch see different states and both be chosen.
      */
     private void resolveOutgoing(String node) {
+        resolveOutgoing(node, true);
+    }
+
+    private void resolveOutgoing(String node, boolean announce) {
         NodeStatus ended = status.get(node);
         List<StateGraph.ConditionalSpec> conditionals = graph.conditionalsFrom(node);
 
@@ -325,11 +409,14 @@ public class GraphRunner {
         // Only the edges that carried are a transition; an unchosen branch is not a move from
         // anywhere to anywhere. The listener is shown the same view the router saw, so that
         // what the node produced is in it
+        if (!announce) {
+            return;
+        }
         drainPendingMerge();
         GraphState seen = visibleTo(node);
         out.forEach((target, edge) -> {
             if (edge == EdgeState.TAKEN) {
-                notify(l -> l.onTransition(node, target, seen));
+                notify(l -> l.onTransition(runId, node, target, seen));
             }
         });
     }

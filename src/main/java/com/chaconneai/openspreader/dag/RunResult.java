@@ -52,6 +52,7 @@ import java.util.Set;
  */
 public class RunResult {
 
+    private final String runId;
     private final CompiledGraph graph;
     private final GraphState state;
     private final Map<String, NodeStatus> statuses;
@@ -61,9 +62,11 @@ public class RunResult {
     private final Map<String, Throwable> failures;
     private final long millis;
 
-    private RunResult(CompiledGraph graph, GraphState state, Map<String, NodeStatus> statuses,
+    private RunResult(String runId, CompiledGraph graph, GraphState state,
+                      Map<String, NodeStatus> statuses,
                       Map<String, NodeOutcome> outcomes, String failedNode, Throwable failure,
                       Map<String, Throwable> failures, long millis) {
+        this.runId = runId;
         this.graph = graph;
         this.state = state;
         this.statuses = statuses;
@@ -74,13 +77,68 @@ public class RunResult {
         this.millis = millis;
     }
 
-    public static RunResult of(CompiledGraph graph, GraphState state,
+    public static RunResult of(String runId, CompiledGraph graph, GraphState state,
                                Map<String, NodeStatus> statuses,
                                Map<String, NodeOutcome> outcomes,
                                String failedNode, Throwable failure,
                                Map<String, Throwable> failures, long millis) {
-        return new RunResult(graph, state, Map.copyOf(statuses), Map.copyOf(outcomes),
-                failedNode, failure, Map.copyOf(failures), millis);
+        // Not Map.copyOf: its iteration order is unspecified, and these are read back in
+        // declaration order by describe() and by anything writing a record
+        return new RunResult(runId, graph, state,
+                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(statuses)),
+                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(outcomes)),
+                failedNode, failure,
+                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(failures)), millis);
+    }
+
+    /**
+     * This run's identity.
+     *
+     * <p>Supplied by the caller, or generated when it was not. It is what ties a stored
+     * record to the run that produced it: every {@link GraphListener} callback carries the
+     * same value, so rows written as the run proceeded and the result handed back at the end
+     * can be matched up afterwards.
+     *
+     * @see CompiledGraph#resume(GraphState, Map, String)
+     */
+    public String runId() {
+        return runId;
+    }
+
+    /**
+     * What {@link CompiledGraph#resume} takes back: every node that <b>ran</b>, and how it
+     * went.
+     *
+     * <p>An application that stores this alongside {@link #state()} has everything it needs
+     * to carry on where this run stopped.
+     *
+     * <h2>Skipped nodes are deliberately not in here</h2>
+     * A skip is not something that happened, it is something that was <b>worked out</b>: a
+     * branch a conditional passed over, or a step whose upstream never arrived. Storing it
+     * as a fact and handing it back would freeze it.
+     *
+     * <p>The case that shows why is the ordinary one. A run fails at {@code Notify}, so
+     * {@code Archive} below it is marked skipped. The failure is fixed and the run is
+     * resumed. Had the skip been restored, {@code Archive} would stay skipped for ever and
+     * the resumed run would finish having done nothing, looking entirely healthy.
+     *
+     * <p>Left out, it is recomputed instead: a conditional on a restored node is evaluated
+     * again and passes over the same branch, while a step that was only skipped because
+     * something above it failed now runs. Nothing is lost by leaving it out, and a
+     * resumed run that silently does nothing is avoided.
+     *
+     * <p>A <b>failed</b> node is in here, as FAILED. Resuming as it stands carries on down
+     * the compensation path exactly as the first run did; removing it from the map first is
+     * how you say "try that step again".
+     */
+    public Map<String, NodeStatus> completed() {
+        Map<String, NodeStatus> done = new LinkedHashMap<>();
+        statuses.forEach((node, status) -> {
+            if (status == NodeStatus.SUCCESS || status == NodeStatus.FAILED) {
+                done.put(node, status);
+            }
+        });
+        return java.util.Collections.unmodifiableMap(done);
     }
 
     /** The channels as they stood when the run ended. */
