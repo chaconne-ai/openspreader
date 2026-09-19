@@ -75,8 +75,25 @@ public abstract class ExternalNode extends GraphNode {
     /** The outward call. Named for what it is; see {@link NodeInvoker#execute}. */
     protected abstract Map<String, Object> call(GraphState state) throws Exception;
 
+    /**
+     * The same, told which step this is and what it was configured with.
+     *
+     * <p>Override this one for a call whose address, method or headers come from the graph
+     * rather than from the code. {@link NodeContext#idempotencyKey()} is worth knowing about
+     * here above anywhere else: an outward call is exactly what must not happen twice.
+     */
+    protected Map<String, Object> call(GraphState state, NodeContext context) throws Exception {
+        return call(state);
+    }
+
     @Override
     public final Map<String, Object> execute(GraphState state) throws Exception {
         return call(state);
+    }
+
+    @Override
+    public final Map<String, Object> execute(GraphState state, NodeContext context)
+            throws Exception {
+        return call(state, context);
     }
 }

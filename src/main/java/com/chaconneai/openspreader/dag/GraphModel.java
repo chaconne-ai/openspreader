@@ -78,8 +78,17 @@ public record GraphModel(String graph, List<String> entries, List<NodeView> node
      * @param local  whether it runs on the coordinating instance rather than being dispatched
      * @param status what became of it in the run being rendered, or null when there is none
      */
+    /**
+     * @param bean   the bean this node dispatches to, or null when it dispatches by class
+     * @param config this node's own settings. A graph built from data is mostly this
+     */
     public record NodeView(String name, String type, String kind, boolean entry, boolean local,
-                           String trigger, int retries, NodeStatus status) {
+                           String trigger, int retries, String bean,
+                           Map<String, Object> config, NodeStatus status) {
+
+        public NodeView {
+            config = config == null ? Map.of() : config;
+        }
     }
 
     /**
@@ -116,6 +125,8 @@ public record GraphModel(String graph, List<String> entries, List<NodeView> node
                     graph.isLocal(name),
                     graph.triggerOf(name).toString(),
                     graph.retriesOf(name),
+                    graph.beanNameOf(name),
+                    graph.configOf(name),
                     statuses == null ? null : statuses.get(name)));
         }
 

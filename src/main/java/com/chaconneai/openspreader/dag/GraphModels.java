@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * The reading half of the round trip, shared by every format.
@@ -39,6 +40,124 @@ import java.util.Map;
 public class GraphModels {
 
     private GraphModels() {
+    }
+
+    // ------------------------------------------------------------------
+    // Model to tree
+    // ------------------------------------------------------------------
+
+    /**
+     * Lays a graph out as maps and lists, ready for a serialiser to write.
+     *
+     * <p>The other half of {@link #fromTree}: JSON and YAML differ in <b>syntax</b> only, so
+     * the shape of a definition is decided once, here, and neither format gets to have an
+     * opinion about it. That is also what makes the two interchangeable, which the round-trip
+     * tests check by writing a graph in one, reading it back, and comparing.
+     *
+     * <p>Keys are in a fixed order, and a node's settings are sorted. Both matter for the
+     * same reason: a stored definition that writes itself out differently on a different day
+     * makes every diff a lie.
+     */
+    public static Map<String, Object> toTree(GraphModel model) {
+        Map<String, Object> tree = new LinkedHashMap<>();
+        tree.put("graph", model.graph());
+        tree.put("entries", List.copyOf(model.entries()));
+        tree.put("inputs", List.copyOf(model.inputs()));
+
+        List<Object> channels = new ArrayList<>();
+        for (GraphModel.ChannelView channel : model.channels()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", channel.name());
+            entry.put("reducer", channel.reducer());
+            channels.add(entry);
+        }
+        tree.put("channels", channels);
+
+        List<Object> nodes = new ArrayList<>();
+        for (GraphModel.NodeView node : model.nodes()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", node.name());
+            entry.put("type", node.type());
+            entry.put("kind", node.kind());
+            entry.put("entry", node.entry());
+            entry.put("local", node.local());
+            entry.put("trigger", node.trigger());
+            entry.put("retries", node.retries());
+            if (node.bean() != null) {
+                entry.put("bean", node.bean());
+            }
+            if (!node.config().isEmpty()) {
+                entry.put("config", sortedDeep(node.config()));
+            }
+            if (node.status() != null) {
+                entry.put("status", node.status().name());
+            }
+            nodes.add(entry);
+        }
+        tree.put("nodes", nodes);
+
+        List<Object> edges = new ArrayList<>();
+        for (GraphModel.EdgeView edge : model.edges()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("from", edge.from());
+            entry.put("to", edge.to());
+            entry.put("kind", edge.kind());
+            entry.put("condition", edge.condition());
+            if (edge.branch() != null) {
+                entry.put("branch", edge.branch());
+            }
+            edges.add(entry);
+        }
+        tree.put("edges", edges);
+
+        List<Object> conditionals = new ArrayList<>();
+        for (GraphModel.ConditionalView conditional : model.conditionals()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("sources", List.copyOf(conditional.sources()));
+            entry.put("form", conditional.form());
+            entry.put("expression", conditional.expression());
+            entry.put("predicates", listWithNulls(conditional.predicates()));
+            List<Object> branches = new ArrayList<>();
+            conditional.branches().forEach((key, targets) -> {
+                Map<String, Object> branch = new LinkedHashMap<>();
+                branch.put("key", key);
+                branch.put("targets", List.copyOf(targets));
+                branches.add(branch);
+            });
+            entry.put("branches", branches);
+            entry.put("else", List.copyOf(conditional.elseTargets()));
+            conditionals.add(entry);
+        }
+        tree.put("conditionals", conditionals);
+        return tree;
+    }
+
+    /**
+     * A node's settings with every map sorted by key, however deep.
+     *
+     * <p>Java's {@code Map.of} randomises its iteration order per JVM, so a graph built with
+     * one would write out differently on every restart. Sorting makes the file a function of
+     * the graph rather than of how it happened to be built.
+     */
+    private static Object sortedDeep(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> out = new TreeMap<>();
+            map.forEach((key, nested) -> out.put(String.valueOf(key), sortedDeep(nested)));
+            return out;
+        }
+        if (value instanceof List<?> list) {
+            List<Object> out = new ArrayList<>(list.size());
+            list.forEach(item -> out.add(sortedDeep(item)));
+            return out;
+        }
+        return value;
+    }
+
+    /** Copies a list that may hold nulls, which {@code List.copyOf} refuses. */
+    private static List<String> listWithNulls(List<String> values) {
+        List<String> out = new ArrayList<>(values.size());
+        out.addAll(values);
+        return Collections.unmodifiableList(out);
     }
 
     // ------------------------------------------------------------------
@@ -75,6 +194,8 @@ public class GraphModels {
                     flag(entry.get("local")),
                     text(entry.get("trigger")),
                     number(entry.get("retries")),
+                    text(entry.get("bean")),
+                    settings(entry.get("config")),
                     status == null ? null : NodeStatus.valueOf(status)));
         }
 
@@ -150,7 +271,19 @@ public class GraphModels {
 
         // Every node first, so that the edges below can be declared by name alone
         for (GraphModel.NodeView node : model.nodes()) {
-            graph.node(node.name(), nodeClass(catalog, node), triggerOf(node.trigger()));
+            if (node.bean() != null) {
+                // Declared by bean name, which is what a graph assembled from data does. No
+                // class is needed and none is looked up
+                graph.node(node.name(), node.bean(), node.config());
+                if (!triggerOf(node.trigger()).equals(Trigger.all())) {
+                    graph.trigger(node.name(), triggerOf(node.trigger()));
+                }
+            } else {
+                graph.node(node.name(), nodeClass(catalog, node), triggerOf(node.trigger()));
+                if (!node.config().isEmpty()) {
+                    graph.node(node.name(), nodeClass(catalog, node), node.config());
+                }
+            }
             if (node.retries() > 0) {
                 graph.retry(node.name(), node.retries());
             }
@@ -328,6 +461,18 @@ public class GraphModels {
         // Not List.copyOf: a null is meaningful here, marking a condition that was a lambda
         list.forEach(item -> out.add(text(item)));
         return Collections.unmodifiableList(out);
+    }
+
+    /** A node's settings as they came back: whatever the format parsed, unchanged. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> settings(Object value) {
+        if (value == null) {
+            return Map.of();
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            throw new DagException("a node's \"config\" should be a map, found \"" + value + "\"");
+        }
+        return Collections.unmodifiableMap(new LinkedHashMap<>((Map<String, Object>) map));
     }
 
     @SuppressWarnings("unchecked")

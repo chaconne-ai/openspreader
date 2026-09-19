@@ -20,16 +20,20 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * Drives one run of one graph. Created per run, used once, thrown away.
@@ -121,6 +125,25 @@ public class GraphRunner {
     private GraphState state = GraphState.empty();
     private String runId;
     private int inflight;
+
+    /**
+     * Nodes waiting out a backoff, by the moment each becomes due.
+     *
+     * <p>A sorted map, so the head is the next thing to do and the loop below knows exactly
+     * how long it may sleep. This is what makes waiting free: no timer is started and no
+     * thread sleeps, because the loop is already waiting for completions and simply wakes no
+     * later than the head of this map.
+     */
+    private final TreeMap<Long, List<String>> dueRetries = new TreeMap<>();
+
+    /** Nodes counted as in flight because they are waiting to be retried. */
+    private int awaitingRetry;
+
+    /** What is running right now, so that a cancellation can stop waiting for it. */
+    private final Map<String, CompletableFuture<NodeOutcome>> running = new LinkedHashMap<>();
+
+    /** Set from another thread; see {@link #cancel}. */
+    private volatile boolean cancelled;
     private String failedNode;
     private Throwable failure;
 
@@ -137,9 +160,12 @@ public class GraphRunner {
     /** How many attempts each node has had. 1 after the first dispatch. */
     private final Map<String, Integer> attempts = new LinkedHashMap<>();
 
+    private final DagStats stats;
+
     public GraphRunner(CompiledGraph graph, DagRuntime runtime) {
         this.graph = graph;
         this.runtime = runtime;
+        this.stats = runtime.stats();
     }
 
     /**
@@ -148,7 +174,7 @@ public class GraphRunner {
      * @param timeoutMs 0 or less waits indefinitely
      */
     public RunResult run(GraphState initial, long timeoutMs) {
-        return run(initial, Map.of(), java.util.UUID.randomUUID().toString(), timeoutMs);
+        return run(initial, Map.of(), UUID.randomUUID().toString(), timeoutMs);
     }
 
     /**
@@ -165,6 +191,7 @@ public class GraphRunner {
         long startedAt = System.currentTimeMillis();
         this.state = initial == null ? GraphState.empty() : initial;
         this.runId = runId;
+        stats.runStarted();
 
         for (String node : graph.nodeNames()) {
             status.put(node, NodeStatus.PENDING);
@@ -189,28 +216,51 @@ public class GraphRunner {
         }
 
         long deadline = timeoutMs > 0 ? startedAt + timeoutMs : Long.MAX_VALUE;
-        while (inflight > 0) {
+        while (inflight > 0 || awaitingRetry > 0) {
+            if (cancelled) {
+                failure = new DagException("graph " + graph.name() + " run " + runId
+                        + " was cancelled with " + inflight + " node(s) still running");
+                stopEverythingInFlight();
+                break;
+            }
+            // Anything whose backoff has run out goes now, before the loop waits again
+            dispatchDueRetries();
+
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) {
                 // A partial result beats none: whatever finished is reported, and the
                 // failure says what was still running when time ran out
                 failure = new DagException("graph " + graph.name() + " ran out of time after "
                         + timeoutMs + "ms with " + inflight + " node(s) still running");
+                stopEverythingInFlight();
                 break;
             }
+            // Wake for whichever comes first: a completion, the deadline, or the next retry
+            // falling due. Without the last one a graph whose only pending work is a backoff
+            // would sit here until the deadline
+            long wait = Math.min(remaining, untilNextRetry());
+
             NodeOutcome outcome;
             try {
-                outcome = completions.poll(remaining, TimeUnit.MILLISECONDS);
+                outcome = completions.poll(wait, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 failure = new DagException("graph " + graph.name()
                         + " was interrupted while running", e);
+                stopEverythingInFlight();
                 break;
             }
             if (outcome == null) {
                 continue;
             }
+            if (isWakeUp(outcome)) {
+                // cancel() put this on the queue purely to wake this thread. Counting it as
+                // a completion would take inflight to zero and end the loop through the
+                // ordinary door, leaving the run looking successful rather than cancelled
+                continue;
+            }
             inflight--;
+            running.remove(outcome.node());
             settle(outcome);
         }
 
@@ -220,7 +270,8 @@ public class GraphRunner {
         drainRemaining();
 
         RunResult result = RunResult.of(runId, graph, state, status, outcomes, failedNode,
-                failure, failures, System.currentTimeMillis() - startedAt);
+                failure, failures, System.currentTimeMillis() - startedAt, cancelled);
+        stats.runFinished(result, cancelled);
         // A run whose failure was routed to a compensation path arrives at onSuccess: it did
         // what the graph said to do. result.failures() is how a listener tells the two apart
         notify(l -> {
@@ -284,12 +335,78 @@ public class GraphRunner {
         }
     }
 
+    /**
+     * Asks this run to stop.
+     *
+     * <p>Called from another thread, which is the only way it could be: the thread that
+     * started the run is inside the loop. So the flag is volatile and nothing else is shared.
+     *
+     * <p>What stopping means is deliberately modest. <b>No more nodes are dispatched</b>, and
+     * the run stops waiting for the ones already out. It does not reach into another replica
+     * and interrupt work that is already running there: the node may be halfway through a
+     * payment, and pretending otherwise would be worse than waiting. Whatever did finish is
+     * still reported, and {@link RunResult#completed()} still says what to skip on a resume.
+     */
+    public void cancel() {
+        cancelled = true;
+        // The loop may be waiting on the queue with a long timeout; this wakes it at once
+        completions.offer(NodeOutcome.failure("", new DagException("cancelled"), "", 0L));
+    }
+
+    /** Whether this run was stopped by {@link #cancel()}. */
+    public boolean isCancelled() {
+        return cancelled;
+    }
+
+    /** The placeholder {@link #cancel()} uses to wake the loop. It is not a node. */
+    private static boolean isWakeUp(NodeOutcome outcome) {
+        return outcome.node() == null || outcome.node().isEmpty();
+    }
+
+    /** Sends out every node whose backoff has run out. */
+    private void dispatchDueRetries() {
+        long now = System.currentTimeMillis();
+        while (!dueRetries.isEmpty() && dueRetries.firstKey() <= now) {
+            List<String> due = dueRetries.pollFirstEntry().getValue();
+            for (String node : due) {
+                awaitingRetry--;
+                dispatch(node);
+            }
+        }
+    }
+
+    /** How long the loop may wait before the next backoff falls due. */
+    private long untilNextRetry() {
+        if (dueRetries.isEmpty()) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(1L, dueRetries.firstKey() - System.currentTimeMillis());
+    }
+
+    /**
+     * Stops waiting for everything still out.
+     *
+     * <p>For the local ones this interrupts the work, since the thread is ours. For a node
+     * running on another replica it cancels only <b>this side's</b> waiting: the far end has
+     * no idea a cancellation happened, which is the honest thing to say about it.
+     */
+    private void stopEverythingInFlight() {
+        running.forEach((node, future) -> future.cancel(true));
+        running.clear();
+        dueRetries.clear();
+        awaitingRetry = 0;
+    }
+
     // ------------------------------------------------------------------
 
     /** One node finished: record it, resolve its outbound edges, then look for new work. */
     private void settle(NodeOutcome outcome) {
         String node = outcome.node();
+        if (isWakeUp(outcome)) {
+            return;
+        }
         outcomes.put(node, outcome);
+        stats.nodeFinished(outcome.ok());
 
         if (outcome.ok()) {
             status.put(node, NodeStatus.SUCCESS);
@@ -303,18 +420,32 @@ public class GraphRunner {
             // the two turns one network wobble into a compensation, which is why the order
             // lives here rather than in everybody's node code
             int used = attempts.getOrDefault(node, 1);
-            if (used <= graph.retriesOf(node)) {
+            // Three questions, in this order: is there an attempt left, is this failure the
+            // kind worth repeating, and is the run still wanted. "Insufficient funds" is a
+            // complete answer, and asking it twice more only costs two backoffs
+            if (used <= graph.retriesOf(node) && graph.worthRetrying(node, thrown) && !cancelled) {
                 int next = used + 1;
                 attempts.put(node, next);
-                log.debug("Graph {} node {} failed, retrying (attempt {} of {}): {}",
-                        graph.name(), node, next, graph.retriesOf(node) + 1, thrown.toString());
+                long delay = graph.backoffOf(node).delayMsBefore(next);
+                log.debug("Graph {} node {} failed, retrying (attempt {} of {}) in {}ms: {}",
+                        graph.name(), node, next, graph.retriesOf(node) + 1, delay,
+                        thrown.toString());
                 notify(l -> l.onRetry(runId, node, next, thrown));
+                stats.retried();
                 // The pool picks a replica afresh on every call, so the next attempt may well
                 // land somewhere else. That is what makes retrying worth anything against
                 // "one instance is unwell"
                 dispatched.remove(node);
                 status.put(node, NodeStatus.PENDING);
-                dispatch(node);
+                if (delay <= 0L) {
+                    dispatch(node);
+                } else {
+                    // Put aside until it is due. It still counts as in flight, or the loop
+                    // would decide the run had finished and leave a node half-retried
+                    awaitingRetry++;
+                    dueRetries.computeIfAbsent(System.currentTimeMillis() + delay,
+                            at -> new ArrayList<>(1)).add(node);
+                }
                 return;
             }
 
@@ -553,7 +684,7 @@ public class GraphRunner {
 
     /** Sends a node out to the cluster. */
     private void dispatch(String node) {
-        if (!dispatched.add(node)) {
+        if (cancelled || !dispatched.add(node)) {
             return;
         }
         // Whatever can be committed is, and the slice then adds anything still buffered from
@@ -561,17 +692,27 @@ public class GraphRunner {
         drainPendingMerge();
         GraphState slice = visibleTo(node);
 
-        Class<? extends GraphNode> type = graph.typeOf(node);
+        // The bean name when the node has one, else the class name. Whichever it is, the far
+        // side looks it up in its registry; nothing is ever resolved into a class from a name
+        // off the wire
+        String target = graph.targetOf(node);
+        // Captured per dispatch rather than once per run: a tracer's current context is a
+        // property of this moment on this thread, and a run may take minutes
+        NodeContext context = new NodeContext(graph.name(), runId, node, graph.configOf(node),
+                runtime.tracing().capture());
 
         attempts.putIfAbsent(node, 1);
         status.put(node, NodeStatus.RUNNING);
         inflight++;
 
-        CompletableFuture<NodeOutcome> future = graph.isLocal(node)
-                ? runLocally(node, type, slice)
+        boolean local = graph.isLocal(node);
+        stats.nodeDispatched(local);
+        CompletableFuture<NodeOutcome> future = local
+                ? runLocally(node, target, context, slice)
                 : runtime.pool().<NodeOutcome>submit(
                         NodeDispatcher.BEAN_NAME, NodeDispatcher.METHOD_NAME,
-                        graph.name(), node, type.getName(), slice);
+                        graph.name(), node, target, slice, context);
+        running.put(node, future);
 
         future.whenComplete((outcome, error) -> {
             if (outcome != null) {
@@ -581,7 +722,7 @@ public class GraphRunner {
             // The dispatch itself failed: no peer, a timeout, serialisation. The node never
             // ran, so there is nothing to report but the dispatch error, and it is turned
             // into an outcome so the main loop has one shape of thing to handle
-            Throwable cause = error instanceof java.util.concurrent.CompletionException
+            Throwable cause = error instanceof CompletionException
                     ? error.getCause() : error;
             completions.add(NodeOutcome.failure(node,
                     new DagException("node " + node + " could not be dispatched", cause),
@@ -605,8 +746,8 @@ public class GraphRunner {
      * one the run waits for for ever. A rejection arrives as a dispatch failure and the node
      * fails visibly.
      */
-    private CompletableFuture<NodeOutcome> runLocally(String node,
-                                                      Class<? extends GraphNode> type,
+    private CompletableFuture<NodeOutcome> runLocally(String node, String target,
+                                                      NodeContext context,
                                                       GraphState slice) {
         if (!runtime.canRunLocally()) {
             return CompletableFuture.completedFuture(NodeOutcome.failure(node,
@@ -616,7 +757,7 @@ public class GraphRunner {
                             + "DagRuntime(pool) does not"), "local", 0L));
         }
         return CompletableFuture.supplyAsync(
-                () -> runtime.local().runNode(graph.name(), node, type.getName(), slice),
+                () -> runtime.local().runNode(graph.name(), node, target, slice, context),
                 runtime.localExecutor());
     }
 
@@ -628,7 +769,7 @@ public class GraphRunner {
      * can still do is be slow: it runs on this thread, and every node waiting to be
      * dispatched waits with it.
      */
-    private void notify(java.util.function.Consumer<GraphListener> call) {
+    private void notify(Consumer<GraphListener> call) {
         for (GraphListener listener : graph.listeners()) {
             try {
                 call.accept(listener);

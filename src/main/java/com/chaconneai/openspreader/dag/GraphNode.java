@@ -96,6 +96,23 @@ public abstract class GraphNode implements NodeInvoker {
     @Override
     public abstract Map<String, Object> execute(GraphState state) throws Exception;
 
+    /**
+     * The same, told which step this is and what it was configured with.
+     *
+     * <p><b>The engine always calls this one.</b> Its default hands straight on to
+     * {@link #execute(GraphState)}, so a node that needs no configuration implements that and
+     * never sees this.
+     *
+     * <p>Override it when <b>one bean serves as several steps</b>: a graph built from rows in
+     * a table, where each row is a node name plus some settings. {@link NodeContext} is how
+     * such a node finds out which row it is running.
+     *
+     * @see HttpGraphNode
+     */
+    public Map<String, Object> execute(GraphState state, NodeContext context) throws Exception {
+        return execute(state);
+    }
+
     /** The name this node carries in a graph unless one is given explicitly. */
     public String defaultName() {
         return getClass().getSimpleName();

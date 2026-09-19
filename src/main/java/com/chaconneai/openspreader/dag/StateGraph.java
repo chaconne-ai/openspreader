@@ -18,10 +18,12 @@ package com.chaconneai.openspreader.dag;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -129,6 +131,8 @@ public class StateGraph {
 
     /** How many further attempts each node gets after a failure. Absent means none. */
     private final Map<String, Integer> retries = new LinkedHashMap<>();
+    private final Map<String, Backoff> backoffs = new LinkedHashMap<>();
+    private final Map<String, Predicate<Throwable>> retryable = new LinkedHashMap<>();
 
     /** Observers, in declaration order. */
     private final List<GraphListener> listeners = new ArrayList<>();
@@ -258,6 +262,126 @@ public class StateGraph {
     }
 
     /**
+     * Registers a node with settings of its own.
+     *
+     * <p>The settings reach the node as {@link NodeContext}, which is how <b>one class can
+     * serve as many steps</b>: the class says how to do the work, and each node says what to
+     * do it to.
+     *
+     * <pre>{@code
+     * .node("FetchRate", HttpGraphNode.class, Map.of(
+     *         "url", "https://fx.internal/rates/${currency}",
+     *         "method", "GET",
+     *         "writeTo", "rate"))
+     * }</pre>
+     *
+     * <p>Values must be the shapes a definition can hold: text, numbers, booleans, lists and
+     * maps of those. They travel with the node to whichever replica runs it, and they are
+     * written out with the graph.
+     */
+    public StateGraph node(String nodeName, Class<? extends GraphNode> type,
+                           Map<String, Object> config) {
+        register(nodeName, type, null, config);
+        return this;
+    }
+
+    /**
+     * Registers a node by <b>bean name</b>, with no class at all.
+     *
+     * <p>This is the form a graph built from data uses: the rows say which bean and with what
+     * settings, and nothing has to be compiled against a class. The node's name is the bean's
+     * name.
+     *
+     * <pre>{@code
+     * for (StepRow row : repository.stepsOf(workflowId)) {
+     *     graph.node(row.name(), row.beanName(), row.config());
+     * }
+     * }</pre>
+     *
+     * <p>It is also how <b>one class has several beans</b>: a class name cannot tell two
+     * beans of one class apart, and a bean name can.
+     */
+    public StateGraph node(String beanName) {
+        register(beanName, null, beanName, null);
+        return this;
+    }
+
+    /** The same, with settings. The node's name is the bean's name. */
+    public StateGraph node(String beanName, Map<String, Object> config) {
+        register(beanName, null, beanName, config);
+        return this;
+    }
+
+    /**
+     * The same, under a node name of its own.
+     *
+     * <p>For using one bean as several steps: the name comes first, as it does in
+     * {@link #node(String, Class)}.
+     */
+    public StateGraph node(String nodeName, String beanName, Map<String, Object> config) {
+        register(nodeName, null, beanName, config);
+        return this;
+    }
+
+    /** The same, with no settings. */
+    public StateGraph nodeOfBean(String nodeName, String beanName) {
+        register(nodeName, null, beanName, null);
+        return this;
+    }
+
+    /**
+     * Decides, per node, which failures are worth trying again.
+     *
+     * <pre>{@code
+     * // your own rule
+     * .retryWhen(Charge.class, thrown -> !(thrown instanceof InsufficientFunds))
+     *
+     * // or the classifier your application already configures for Spring Retry
+     * .retryWhen(Charge.class, classifier::classify)
+     * }</pre>
+     *
+     * <h2>Why this is a predicate and not a retry framework</h2>
+     * Deciding <b>whether</b> an exception is worth another attempt is a pure question about
+     * that exception, and Spring Retry's {@code BinaryExceptionClassifier} answers it well.
+     * A method reference is all it takes to use one, and nothing here has to know it exists.
+     *
+     * <p>What could <b>not</b> be handed over is the retrying itself. {@code RetryTemplate}
+     * loops in the calling thread and sleeps between attempts; here an attempt is a
+     * <b>dispatch</b>, the work runs on another replica, and the coordinating thread must
+     * stay free to settle every other branch of the graph. A run that slept through its
+     * backoff would stall the branches that had nothing to do with it.
+     *
+     * <p>Without this, every failure is retried, which is right for a timeout and wasteful
+     * for "insufficient funds": three more attempts, two more backoffs, and the same answer.
+     *
+     * <p>A predicate is code, so it is <b>not</b> written out with the definition; see
+     * {@link GraphCatalog} for the same limit on lambda conditions and reducers.
+     */
+    public StateGraph retryWhen(Class<? extends GraphNode> type, Predicate<Throwable> worthRetrying) {
+        return retryWhen(register(simpleNameOf(type), type), worthRetrying);
+    }
+
+    /** The same, by node name. */
+    public StateGraph retryWhen(String nodeName, Predicate<Throwable> worthRetrying) {
+        if (worthRetrying == null) {
+            throw new IllegalArgumentException("retryWhen() needs a predicate");
+        }
+        retryable.put(nodeName, worthRetrying);
+        return this;
+    }
+
+    /**
+     * Fixes a node's trigger by name.
+     *
+     * <p>The form a graph built from data needs: there is no class to hang it off, and
+     * declaring the node and declaring how it fires are two separate rows.
+     */
+    public StateGraph trigger(String nodeName, Trigger trigger) {
+        requireTrigger(nodeName, trigger);
+        return this;
+    }
+
+    /**
      * Marks nodes as running <b>on the coordinating instance</b>, not dispatched.
      *
      * <pre>{@code
@@ -326,13 +450,39 @@ public class StateGraph {
 
     /** The same, by node name. */
     public StateGraph retry(String nodeName, int times) {
+        return retry(nodeName, times, Backoff.none());
+    }
+
+    /**
+     * Tries a node again, waiting between attempts.
+     *
+     * <pre>{@code
+     * .retry(Charge.class, 2, Backoff.exponential(Duration.ofMillis(200)))
+     * }</pre>
+     *
+     * <p>Against a service that is struggling rather than flapping, three attempts inside a
+     * few milliseconds are three requests it did not need. See {@link Backoff}, including why
+     * the waiting costs no thread.
+     */
+    public StateGraph retry(Class<? extends GraphNode> type, int times, Backoff backoff) {
+        return retry(register(simpleNameOf(type), type), times, backoff);
+    }
+
+    /** The same, by node name. */
+    public StateGraph retry(String nodeName, int times, Backoff backoff) {
         if (times < 0) {
             throw new IllegalArgumentException("retry count must not be negative: " + times);
         }
         if (times == 0) {
             retries.remove(nodeName);
+            backoffs.remove(nodeName);
+            return this;
+        }
+        retries.put(nodeName, times);
+        if (backoff != null && !backoff.isNone()) {
+            backoffs.put(nodeName, backoff);
         } else {
-            retries.put(nodeName, times);
+            backoffs.remove(nodeName);
         }
         return this;
     }
@@ -416,7 +566,8 @@ public class StateGraph {
      */
     public CompiledGraph compile() {
         return CompiledGraph.of(name, entries, nodes, edges, conditionals, reducers,
-                declaredTriggers, localNodes, retries, listeners, inputs);
+                declaredTriggers, localNodes, retries, backoffs, retryable, listeners,
+                inputs);
     }
 
     // ------------------------------------------------------------------
@@ -485,9 +636,41 @@ public class StateGraph {
             return StateGraph.this.local(types);
         }
 
+        /** The same, by node name. A graph built by name needs this to stay one chain. */
+        public final StateGraph local(String... nodeNames) {
+            return StateGraph.this.local(nodeNames);
+        }
+
         /** Tries a node again when it fails. Off by default. */
         public final StateGraph retry(Class<? extends GraphNode> type, int times) {
             return StateGraph.this.retry(type, times);
+        }
+
+        /** The same, by node name. */
+        public final StateGraph retry(String nodeName, int times) {
+            return StateGraph.this.retry(nodeName, times);
+        }
+
+        /** Retries with a wait between attempts; see {@link Backoff}. */
+        public final StateGraph retry(Class<? extends GraphNode> type, int times,
+                                      Backoff backoff) {
+            return StateGraph.this.retry(type, times, backoff);
+        }
+
+        /** The same, by node name. */
+        public final StateGraph retry(String nodeName, int times, Backoff backoff) {
+            return StateGraph.this.retry(nodeName, times, backoff);
+        }
+
+        /** Which failures are worth another attempt; see {@link StateGraph#retryWhen}. */
+        public final StateGraph retryWhen(Class<? extends GraphNode> type,
+                                          Predicate<Throwable> worthRetrying) {
+            return StateGraph.this.retryWhen(type, worthRetrying);
+        }
+
+        /** The same, by node name. */
+        public final StateGraph retryWhen(String nodeName, Predicate<Throwable> worthRetrying) {
+            return StateGraph.this.retryWhen(nodeName, worthRetrying);
         }
 
         /** Adds an observer. */
@@ -867,17 +1050,53 @@ public class StateGraph {
     // ------------------------------------------------------------------
 
     private String register(String nodeName, Class<? extends GraphNode> type) {
+        return register(nodeName, type, null, null);
+    }
+
+    /**
+     * Records a node, and refuses a second one that disagrees with the first.
+     *
+     * <p>A name is the node's identity, so letting a later declaration quietly win would mean
+     * the graph that runs is not the graph that was drawn. Mentioning the same node again
+     * with the same implementation is ordinary, though: every edge does it.
+     */
+    private String register(String nodeName, Class<? extends GraphNode> type, String beanName,
+                            Map<String, Object> config) {
         NodeSpec existing = nodes.get(nodeName);
         if (existing != null) {
-            if (!existing.type().equals(type)) {
+            if (type != null && existing.type() != null && !existing.type().equals(type)) {
                 throw new DagException("node " + nodeName + " is already registered as "
                         + existing.type().getName() + " and cannot also be " + type.getName()
                         + ". Give one of them a name of its own with node(name, class)");
             }
+            if (beanName != null && existing.beanName() != null
+                    && !existing.beanName().equals(beanName)) {
+                throw new DagException("node " + nodeName + " is already registered against "
+                        + "bean \"" + existing.beanName() + "\" and cannot also be \""
+                        + beanName + "\". Give one of them a name of its own");
+            }
+            // A later mention may fill in what the first left out, which is what makes
+            // "declare the node, then draw the edges" work in either order
+            nodes.put(nodeName, new NodeSpec(nodeName,
+                    type != null ? type : existing.type(),
+                    beanName != null ? beanName : existing.beanName(),
+                    config != null && !config.isEmpty() ? frozen(config) : existing.config()));
             return nodeName;
         }
-        nodes.put(nodeName, new NodeSpec(nodeName, type));
+        nodes.put(nodeName, new NodeSpec(nodeName, type, beanName, frozen(config)));
         return nodeName;
+    }
+
+    /**
+     * An unmodifiable copy of a node's settings that keeps their order.
+     *
+     * <p>Not {@code Map.copyOf}, whose iteration order is unspecified: these are written out
+     * with the definition, and an order that changes by itself makes every stored graph look
+     * edited when it is not.
+     */
+    private static Map<String, Object> frozen(Map<String, Object> config) {
+        return config == null || config.isEmpty() ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(config));
     }
 
     /**
@@ -907,8 +1126,29 @@ public class StateGraph {
     // Internal specifications, handed to CompiledGraph
     // ------------------------------------------------------------------
 
-    /** A node as declared: its name in this graph, and the class that does the work. */
-    record NodeSpec(String name, Class<? extends GraphNode> type) {
+    /**
+     * A node as declared.
+     *
+     * @param name     its name in this graph, and the key everything else refers to it by
+     * @param type     the class that does the work, or null when the node was declared by
+     *                 bean name alone, which is what a graph built from data does
+     * @param beanName the bean to dispatch to, or null to dispatch by class. Declaring it is
+     *                 what lets <b>one class have several beans</b>, since a class name can
+     *                 no longer tell them apart
+     * @param config   this node's own settings, handed to it as {@link NodeContext}. Empty
+     *                 for a node that needs none
+     */
+    record NodeSpec(String name, Class<? extends GraphNode> type, String beanName,
+                    Map<String, Object> config) {
+
+        NodeSpec(String name, Class<? extends GraphNode> type) {
+            this(name, type, null, Map.of());
+        }
+
+        /** What the dispatcher is asked for: the bean name when there is one, else the class. */
+        String target() {
+            return beanName != null ? beanName : (type == null ? name : type.getName());
+        }
     }
 
     /**
@@ -973,7 +1213,7 @@ public class StateGraph {
         /** Whether this conditional can be written out and read back. */
         public boolean isLoadable() {
             if (!predicateExpressions.isEmpty()) {
-                return predicateExpressions.stream().noneMatch(java.util.Objects::isNull)
+                return predicateExpressions.stream().noneMatch(Objects::isNull)
                         && predicateExpressions.size() == branches.size();
             }
             return expression != null;

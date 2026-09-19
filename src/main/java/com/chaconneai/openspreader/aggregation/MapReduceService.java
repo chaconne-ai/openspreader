@@ -24,6 +24,7 @@ import com.chaconneai.spreader.loadbalance.LoadBalancer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -809,7 +810,7 @@ public class MapReduceService implements MultiProcessingService {
             Map<Object, Object> result,
             Map<Integer, long[]> shardStats,
             long reduceCalls,
-            long reduceNanos) implements java.io.Serializable {
+            long reduceNanos) implements Serializable {
     }
 
     // ==================================================================

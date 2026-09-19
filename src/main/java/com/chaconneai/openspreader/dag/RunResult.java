@@ -17,6 +17,7 @@ package com.chaconneai.openspreader.dag;
 
 import com.chaconneai.openspreader.dag.NodeOutcome;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -61,11 +62,12 @@ public class RunResult {
     private final Throwable failure;
     private final Map<String, Throwable> failures;
     private final long millis;
+    private final boolean cancelled;
 
     private RunResult(String runId, CompiledGraph graph, GraphState state,
                       Map<String, NodeStatus> statuses,
                       Map<String, NodeOutcome> outcomes, String failedNode, Throwable failure,
-                      Map<String, Throwable> failures, long millis) {
+                      Map<String, Throwable> failures, long millis, boolean cancelled) {
         this.runId = runId;
         this.graph = graph;
         this.state = state;
@@ -75,20 +77,23 @@ public class RunResult {
         this.failure = failure;
         this.failures = failures;
         this.millis = millis;
+        this.cancelled = cancelled;
     }
 
     public static RunResult of(String runId, CompiledGraph graph, GraphState state,
                                Map<String, NodeStatus> statuses,
                                Map<String, NodeOutcome> outcomes,
                                String failedNode, Throwable failure,
-                               Map<String, Throwable> failures, long millis) {
+                               Map<String, Throwable> failures, long millis,
+                               boolean cancelled) {
         // Not Map.copyOf: its iteration order is unspecified, and these are read back in
         // declaration order by describe() and by anything writing a record
         return new RunResult(runId, graph, state,
-                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(statuses)),
-                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(outcomes)),
+                Collections.unmodifiableMap(new LinkedHashMap<>(statuses)),
+                Collections.unmodifiableMap(new LinkedHashMap<>(outcomes)),
                 failedNode, failure,
-                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(failures)), millis);
+                Collections.unmodifiableMap(new LinkedHashMap<>(failures)), millis,
+                cancelled);
     }
 
     /**
@@ -138,7 +143,7 @@ public class RunResult {
                 done.put(node, status);
             }
         });
-        return java.util.Collections.unmodifiableMap(done);
+        return Collections.unmodifiableMap(done);
     }
 
     /** The channels as they stood when the run ended. */
@@ -148,6 +153,17 @@ public class RunResult {
 
     public CompiledGraph graph() {
         return graph;
+    }
+
+    /**
+     * Whether somebody stopped this run.
+     *
+     * <p>Told apart from an ordinary failure because it is not one: nothing went wrong, a
+     * decision was made. {@link #failed()} is true either way, since the run did not finish
+     * what it was asked to do.
+     */
+    public boolean cancelled() {
+        return cancelled;
     }
 
     /** How long the whole run took, dispatch included. */

@@ -24,6 +24,9 @@ import com.chaconneai.openspreader.cache.ProcessingCache;
 import com.chaconneai.openspreader.cache.MultiProcessingCache;
 import com.chaconneai.openspreader.dag.MultiProcessingDag;
 import com.chaconneai.openspreader.dag.GraphNode;
+import com.chaconneai.openspreader.dag.HttpGraphNode;
+import com.chaconneai.openspreader.dag.RestClientGraphNode;
+import com.chaconneai.openspreader.dag.TracePropagation;
 import com.chaconneai.openspreader.dag.ProcessingDag;
 import com.chaconneai.openspreader.dag.DagRuntime;
 import com.chaconneai.openspreader.dag.NodeDispatcher;
@@ -55,14 +58,17 @@ import org.springframework.context.ApplicationContext;
 
 import java.util.Map;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import com.chaconneai.openspreader.concurrent.ExecutorServiceHolder;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.scheduling.TaskScheduler;
+import org.springframework.web.client.RestClient;
 
 /**
  * Auto-configuration for the multi-processing toolkit: locks, semaphores, latches, barriers,
@@ -246,9 +252,50 @@ public class MultiProcessingAutoConfiguration {
     @ConditionalOnMissingBean
     @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.dag", name = "enabled",
             havingValue = "true", matchIfMissing = false)
-    public NodeDispatcher dagNodeDispatcher(ObjectProvider<GraphNode> nodes,
-            GossipCluster cluster) {
-        return new NodeDispatcher(nodes.orderedStream().toList(), cluster.self().label());
+    public NodeDispatcher dagNodeDispatcher(ObjectProvider<Map<String, GraphNode>> nodes,
+            ObjectProvider<TracePropagation> tracing, GossipCluster cluster) {
+        // By bean name, not by class: a class may have several beans, each configured
+        // differently, and that is exactly what a graph assembled from data does
+        NodeDispatcher dispatcher =
+                new NodeDispatcher(nodes.getIfAvailable(Map::of), cluster.self().label());
+        // The executing side's own choice: it is this process's tracer that would have to
+        // understand the carrier. Without a bean, the run's identity still reaches the log
+        // context, which is what most people want from it
+        tracing.ifAvailable(dispatcher::setTracing);
+        return dispatcher;
+    }
+
+    /**
+     * The HTTP step, when the application has {@code spring-web}.
+     *
+     * <p>A nested configuration rather than a plain {@code @Bean} so that nothing here
+     * mentions {@code RestClient} unless the class is present: an optional dependency that
+     * is absent must not stop the rest of this auto-configuration from loading.
+     *
+     * <p>Registered under a fixed name so a graph can say
+     * {@code node("FetchRate", HttpGraphNode.BEAN_NAME, Map.of("url", ...))} without the
+     * application writing anything. Declaring a bean of that name replaces it outright,
+     * which is how another client, or a stub, goes in.
+     */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(name = "org.springframework.web.client.RestClient")
+    @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.dag", name = "enabled",
+            havingValue = "true", matchIfMissing = false)
+    public static class DagHttpNodeConfiguration {
+
+        /**
+         * @param builders the application's own {@code RestClient.Builder} when it has one,
+         *                 so that whatever it configured there holds for the graph's calls
+         *                 as well. Without one, a plain client
+         */
+        @Bean(name = HttpGraphNode.BEAN_NAME)
+        @ConditionalOnMissingBean(name = HttpGraphNode.BEAN_NAME)
+        public HttpGraphNode httpGraphNode(
+                ObjectProvider<RestClient.Builder> builders) {
+            RestClient.Builder builder = builders.getIfAvailable();
+            return new RestClientGraphNode(builder != null ? builder.build()
+                    : RestClient.create());
+        }
     }
 
     /**
@@ -268,14 +315,16 @@ public class MultiProcessingAutoConfiguration {
     @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.dag", name = "enabled",
             havingValue = "true", matchIfMissing = false)
     public ProcessingDag processingDag(MultiProcessingPool pool, NodeDispatcher dispatcher,
-            ExecutorServiceHolder executors, MultiProcessingProperties props) {
+            ExecutorServiceHolder executors, MultiProcessingProperties props,
+            ObjectProvider<TracePropagation> tracing) {
         MultiProcessingProperties.Dag dag = props.getDag();
         log.info("DAG engine started: default run timeout={}",
                 dag.getDefaultTimeoutMs() == 0 ? "none" : dag.getDefaultTimeoutMs() + "ms");
         // The dispatcher is passed in twice over, so to speak: peers reach it through the
         // pool, and nodes declared local() are handed to it directly on this instance
         return new MultiProcessingDag(
-                new DagRuntime(pool, dispatcher, executors.forDagLocal()),
+                new DagRuntime(pool, dispatcher, executors.forDagLocal(), null, null, null,
+                        tracing.getIfAvailable()),
                 dag.getDefaultTimeoutMs());
     }
 

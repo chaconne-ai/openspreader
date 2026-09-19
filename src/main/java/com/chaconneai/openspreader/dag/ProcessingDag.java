@@ -71,4 +71,29 @@ public interface ProcessingDag {
 
     /** The runtime, for a caller assembling graphs by hand. */
     DagRuntime runtime();
+
+    /**
+     * Asks a run going on <b>this instance</b> to stop.
+     *
+     * <p>No more nodes are dispatched and the run stops waiting for the ones already out. It
+     * does not reach into another replica to interrupt work already running there: that node
+     * may be halfway through a payment. Whatever finished is still reported, and
+     * {@code RunResult.completed()} still says what a resume should skip.
+     *
+     * @return whether there was such a run to ask. False for one that has already finished,
+     *         which is an ordinary race rather than an error
+     */
+    default boolean cancel(String runId) {
+        return runtime().runs().cancel(runId);
+    }
+
+    /**
+     * What the engine has been doing on this instance, counted.
+     *
+     * <p>The same numbers the metrics endpoint publishes, for an application that would
+     * rather read them itself.
+     */
+    default DagStats stats() {
+        return runtime().stats();
+    }
 }

@@ -27,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -71,6 +72,8 @@ public class CompiledGraph {
     private final Set<String> entries;
     private final Set<String> localNodes;
     private final Map<String, Integer> retries;
+    private final Map<String, Backoff> backoffs;
+    private final Map<String, Predicate<Throwable>> retryable;
     private final List<GraphListener> listeners;
     private final Map<String, Object> inputs;
 
@@ -108,12 +111,16 @@ public class CompiledGraph {
                           List<StateGraph.ConditionalSpec> conditionals,
                           Map<String, Reducer<?>> reducers, Map<String, Trigger> triggers,
                           Map<String, Set<String>> ancestors, Set<String> localNodes,
-                          Map<String, Integer> retries, List<GraphListener> listeners,
+                          Map<String, Integer> retries, Map<String, Backoff> backoffs,
+                          Map<String, Predicate<Throwable>> retryable,
+                          List<GraphListener> listeners,
                           Map<String, Object> inputs, DagRuntime runtime) {
         this.name = name;
         this.entries = entries;
         this.localNodes = localNodes;
         this.retries = retries;
+        this.backoffs = backoffs;
+        this.retryable = retryable;
         this.listeners = listeners;
         this.inputs = inputs;
         this.conditions = conditions;
@@ -133,7 +140,9 @@ public class CompiledGraph {
                             List<StateGraph.ConditionalSpec> conditionals,
                             Map<String, Reducer<?>> reducers,
                             Map<String, Trigger> declaredTriggers, Set<String> localNodes,
-                            Map<String, Integer> retries, List<GraphListener> listeners,
+                            Map<String, Integer> retries, Map<String, Backoff> backoffs,
+                            Map<String, Predicate<Throwable>> retryable,
+                            List<GraphListener> listeners,
                             Map<String, Object> inputs) {
 
         Map<String, StateGraph.NodeSpec> frozenNodes = ordered(nodes);
@@ -172,7 +181,8 @@ public class CompiledGraph {
                 freeze(allEdges), freeze(reverse), ordered(frozenConditions),
                 List.copyOf(conditionals),
                 ordered(reducers), ordered(triggers), freeze(ancestors),
-                ordered(localNodes), ordered(retries), List.copyOf(listeners),
+                ordered(localNodes), ordered(retries), ordered(backoffs), ordered(retryable),
+                List.copyOf(listeners),
                 // Not Map.copyOf: an optional input may legitimately default to null, and
                 // Map.copyOf refuses null values
                 Collections.unmodifiableMap(new LinkedHashMap<>(inputs)), null);
@@ -187,8 +197,8 @@ public class CompiledGraph {
      */
     public CompiledGraph withRuntime(DagRuntime runtime) {
         return new CompiledGraph(name, entries, nodes, edges, reverseEdges, conditions,
-                conditionals, reducers, triggers, ancestors, localNodes, retries, listeners,
-                inputs, runtime);
+                conditionals, reducers, triggers, ancestors, localNodes, retries, backoffs,
+                retryable, listeners, inputs, runtime);
     }
 
     // ------------------------------------------------------------------
@@ -308,9 +318,26 @@ public class CompiledGraph {
      *       state. A condition written as SpEL is a pure function of the channels and gives
      *       the same branch; a lambda reading something else might not;</li>
      *   <li>a node interrupted <b>mid-flight</b> was never finished, so it is not in
-     *       {@code completed} and it runs again. Whether that is safe is the same question
-     *       {@code retry(...)} asks, and it has the same answer: make the node idempotent.</li>
+     *       {@code completed} and it runs again;</li>
+     *   <li><b>and so does a node that did finish, if the record of it never landed.</b>
+     *       This is the subtler one and it deserves saying plainly: the record is written by
+     *       {@code onNodeFinished}, which runs on the coordinating instance. A node that ran
+     *       on a replica, reported back, and whose row had not been written when the
+     *       coordinator died, is a step that <b>happened</b> and is <b>not in the record</b>.
+     *       It will run again.</li>
      * </ul>
+     *
+     * <p>So resuming is <b>at-least-once, not exactly-once</b>, and no arrangement of this
+     * engine makes it otherwise: an effect outside this process cannot be made atomic with a
+     * row inside it. What that costs depends entirely on the node. A lookup or a calculation
+     * pays nothing. A write with a primary key pays nothing. <b>A payment pays twice.</b>
+     *
+     * <p>Which is why {@link NodeContext#idempotencyKey()} exists and why it is derived
+     * rather than generated: {@code runId + node} is the same on the first attempt, on a
+     * retry, and on a resumed run a day later, so the far side can recognise the repeat.
+     * A node with an outward effect that cannot be made idempotent is a node that should not
+     * be resumed automatically, and that is a decision for the application rather than
+     * something this engine can decide for it.
      *
      * @param state     the channels as they stood, typically {@link RunResult#state()} as
      *                  stored
@@ -346,8 +373,17 @@ public class CompiledGraph {
                     + "through the ProcessingDag bean, which binds one, or attach one with "
                     + "withRuntime(...) when using this outside Spring");
         }
-        return new GraphRunner(this, runtime)
-                .run(prepared, completed, runId, unit.toMillis(Math.max(0L, timeout)));
+        GraphRunner runner = new GraphRunner(this, runtime);
+        // Registered for the length of the run, so that cancel(runId) has something to find.
+        // Removed in a finally, because a run that ended but is still listed would make
+        // cancel() report success and do nothing
+        runtime.runs().add(runId, runner);
+        try {
+            return runner.run(prepared, completed, runId,
+                    unit.toMillis(Math.max(0L, timeout)));
+        } finally {
+            runtime.runs().remove(runId);
+        }
     }
 
     /**
@@ -480,6 +516,35 @@ public class CompiledGraph {
         return nodes.keySet();
     }
 
+    /**
+     * This node's own settings, empty when it has none.
+     *
+     * <p>Handed to the node as {@link NodeContext} wherever it runs, and written out with the
+     * definition, because a graph built from data is mostly its settings.
+     */
+    public Map<String, Object> configOf(String node) {
+        StateGraph.NodeSpec spec = nodes.get(node);
+        return spec == null ? Map.of() : spec.config();
+    }
+
+    /** The bean this node dispatches to, or null when it dispatches by class. */
+    public String beanNameOf(String node) {
+        StateGraph.NodeSpec spec = nodes.get(node);
+        return spec == null ? null : spec.beanName();
+    }
+
+    /**
+     * What the dispatcher is asked for: the bean name when the node has one, else the class.
+     *
+     * <p>Two ways of naming the same thing, and the reason both exist is that a class name
+     * cannot tell two beans of one class apart, while an application that never does that
+     * should not have to name its beans.
+     */
+    public String targetOf(String node) {
+        StateGraph.NodeSpec spec = nodes.get(node);
+        return spec == null ? node : spec.target();
+    }
+
     public Class<? extends GraphNode> typeOf(String node) {
         StateGraph.NodeSpec spec = nodes.get(node);
         return spec == null ? null : spec.type();
@@ -501,6 +566,24 @@ public class CompiledGraph {
      * <p>Declared with {@code StateGraph.local(...)}; see {@link NodeInvoker} for why it is a
      * property of the graph and not of the node.
      */
+    /**
+     * How long to wait before trying this node again. {@link Backoff#none()} unless declared.
+     */
+    public Backoff backoffOf(String node) {
+        return backoffs.getOrDefault(node, Backoff.none());
+    }
+
+    /**
+     * Whether this failure is worth another attempt.
+     *
+     * <p>True unless the graph said otherwise, which keeps the default what it has always
+     * been: a declared retry count applies to whatever went wrong.
+     */
+    public boolean worthRetrying(String node, Throwable thrown) {
+        Predicate<Throwable> predicate = retryable.get(node);
+        return predicate == null || predicate.test(thrown);
+    }
+
     public boolean isLocal(String node) {
         return localNodes.contains(node);
     }
@@ -516,7 +599,7 @@ public class CompiledGraph {
     }
 
     /** The declared inputs: channel to its default, or a sentinel for the required ones. */
-    public java.util.Set<String> declaredInputs() {
+    public Set<String> declaredInputs() {
         return inputs.keySet();
     }
 
