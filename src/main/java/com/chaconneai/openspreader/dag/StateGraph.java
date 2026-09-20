@@ -323,8 +323,14 @@ public class StateGraph {
         return this;
     }
 
-    /** The same, with no settings. */
-    public StateGraph nodeOfBean(String nodeName, String beanName) {
+    /**
+     * The same, with no settings.
+     *
+     * <p>The node's name comes first and what implements it second, exactly as in
+     * {@link #node(String, Class)}: one bean, used as two steps, is the case both forms
+     * exist for.
+     */
+    public StateGraph node(String nodeName, String beanName) {
         register(nodeName, null, beanName, null);
         return this;
     }
@@ -609,6 +615,11 @@ public class StateGraph {
         }
 
         /** Registers a node under a name of its own. */
+        /** A node by bean name; see {@link StateGraph#node(String, String)}. */
+        public final StateGraph node(String nodeName, String beanName) {
+            return StateGraph.this.node(nodeName, beanName);
+        }
+
         public final StateGraph node(String nodeName, Class<? extends GraphNode> type) {
             return StateGraph.this.node(nodeName, type);
         }
