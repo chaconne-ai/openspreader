@@ -17,6 +17,7 @@ package com.chaconneai.openspreader.metrics;
 
 import com.chaconneai.openspreader.MultiProcessingService;
 import com.chaconneai.openspreader.cache.CacheService;
+import com.chaconneai.openspreader.dag.DagStats;
 import com.chaconneai.openspreader.rpc.RpcService;
 import com.chaconneai.openspreader.sync.BarrierService;
 import com.chaconneai.openspreader.sync.ExchangerService;
@@ -100,6 +101,7 @@ public class ComponentMeterBinder implements MeterBinder {
     private final SemaphoreService semaphore;
     private final ExchangerService exchanger;
     private final RpcService rpc;
+    private final DagStats dag;
 
     /** Task names already registered, so nothing is registered twice. */
     private final Set<String> registeredTasks = ConcurrentHashMap.newKeySet();
@@ -112,7 +114,7 @@ public class ComponentMeterBinder implements MeterBinder {
      */
     public ComponentMeterBinder(CacheService cache, MutexService mutex,
                                 PoolService pool, MultiProcessingTaskStats scheduled) {
-        this(cache, mutex, pool, scheduled, null, null, null, null, null);
+        this(cache, mutex, pool, scheduled, null, null, null, null, null, null);
     }
 
     /**
@@ -124,6 +126,15 @@ public class ComponentMeterBinder implements MeterBinder {
                                 LatchService latch, BarrierService barrier,
                                 SemaphoreService semaphore, ExchangerService exchanger,
                                 RpcService rpc) {
+        this(cache, mutex, pool, scheduled, latch, barrier, semaphore, exchanger, rpc, null);
+    }
+
+    /** The same, with the DAG engine's counters. Null when the engine is switched off. */
+    public ComponentMeterBinder(CacheService cache, MutexService mutex,
+                                PoolService pool, MultiProcessingTaskStats scheduled,
+                                LatchService latch, BarrierService barrier,
+                                SemaphoreService semaphore, ExchangerService exchanger,
+                                RpcService rpc, DagStats dag) {
         this.cache = cache;
         this.mutex = mutex;
         this.pool = pool;
@@ -133,6 +144,7 @@ public class ComponentMeterBinder implements MeterBinder {
         this.semaphore = semaphore;
         this.exchanger = exchanger;
         this.rpc = rpc;
+        this.dag = dag;
     }
 
     @Override
@@ -154,6 +166,9 @@ public class ComponentMeterBinder implements MeterBinder {
         }
         if (barrier != null) {
             bindBarrier(registry);
+        }
+        if (dag != null) {
+            bindDag(registry);
         }
         if (semaphore != null) {
             bindSemaphore(registry);
@@ -417,6 +432,52 @@ public class ComponentMeterBinder implements MeterBinder {
     // ------------------------------------------------------------------
     // Task dispatch
     // ------------------------------------------------------------------
+
+    /**
+     * The DAG engine.
+     *
+     * <p>It was the one component here with no metrics at all, which meant a workflow's
+     * behaviour could only be read from its own {@code RunResult}: no use to anybody watching
+     * a dashboard. These are the questions an operator actually asks.
+     *
+     * <p>Note what is <b>not</b> published: anything per node name. A graph may have hundreds
+     * of nodes, and a series per node would multiply every one of these by that. Per-node
+     * timings live on the run itself, where they cost nothing.
+     */
+    private void bindDag(MeterRegistry registry) {
+        num(registry, "spreader.dag.runs.started", "graph runs begun on this instance",
+                dag, DagStats::runsStarted);
+        num(registry, "spreader.dag.runs.succeeded",
+                "runs that finished with no unhandled failure, compensated ones included",
+                dag, DagStats::runsSucceeded);
+        num(registry, "spreader.dag.runs.failed", "runs stopped by something unhandled",
+                dag, DagStats::runsFailed);
+        num(registry, "spreader.dag.runs.cancelled", "runs somebody asked to stop",
+                dag, DagStats::runsCancelled);
+        // The one to alert on: it should come back down. A number that only rises is runs
+        // that never end, which a timeout would have caught and evidently did not
+        num(registry, "spreader.dag.runs.inflight", "runs going on right now",
+                dag, DagStats::runsInFlight);
+        num(registry, "spreader.dag.runs.millis",
+                "total time spent in runs; against the run count, an average",
+                dag, DagStats::runMillis);
+
+        num(registry, "spreader.dag.nodes.run", "node executions that finished",
+                dag, DagStats::nodesRun);
+        num(registry, "spreader.dag.nodes.failed", "node executions that threw, retried ones included",
+                dag, DagStats::nodesFailed);
+        num(registry, "spreader.dag.nodes.skipped",
+                "nodes a conditional passed over, or whose upstream never arrived",
+                dag, DagStats::nodesSkipped);
+        num(registry, "spreader.dag.nodes.dispatched", "nodes sent out to be run",
+                dag, DagStats::nodesDispatched);
+        // Against dispatched, the ratio worth watching: a graph running nearly all its work
+        // locally is not being spread, which is the reason this engine exists
+        num(registry, "spreader.dag.nodes.local", "of those, the ones that ran on this instance",
+                dag, DagStats::nodesLocal);
+        // A rising retry count is a dependency degrading well before it fails outright
+        num(registry, "spreader.dag.retries", "retries begun", dag, DagStats::retries);
+    }
 
     private void bindPool(MeterRegistry registry) {
         // ThreadPoolExecutor's three first, under the same names, so operations recognises

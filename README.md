@@ -314,46 +314,178 @@ different instances, and a single instance is still a valid deployment.
 | **The definition can be stored** | `JsonRenderer` and `YamlRenderer` write a graph out and read it back, with a `GraphCatalog` supplying the node classes. Nothing is resolved by `Class.forName` |
 | **And drawn** | `flow.toMermaid()` for a README, `result.toMermaid()` for a finished run with each node coloured by what became of it |
 | **Persistence is the application's, and the seams are here** | Every run has an identity, every callback carries it, each node is reported as it finishes, and `resume(state, completed, runId)` carries on without re-running what already ran |
+| **Retries can back off** | `retry(Charge.class, 2, Backoff.exponential(Duration.ofMillis(200)))`, with jitter where fifty runs would otherwise retry in the same instant. The waiting costs no thread: the coordinator's loop simply wakes no later than the next attempt falls due |
+| **A run can be stopped** | `dag.cancel(runId)` stops dispatching and stops waiting. It does not reach into another replica to interrupt work already running there, because that node may be halfway through a payment. What finished is still reported and still resumable |
+| **It reports to Micrometer like everything else** | `spreader.dag.*`: runs started, succeeded, failed, cancelled, in flight, plus nodes run, failed, skipped, dispatched, local, and retries. Nothing per node name, which is how a cardinality problem starts |
+| **Only failures worth repeating are repeated** | `retryWhen(Charge.class, classifier::classify)` takes a predicate, so the `BinaryExceptionClassifier` an application already configures for Spring Retry plugs straight in. "Insufficient funds" is a complete answer; asking it twice more costs two backoffs and changes nothing |
+| **One run reads as one thing across replicas** | The run, graph and node names reach the log context on whichever instance runs the node, with no dependency at all. A real distributed trace is ten lines of your tracer through the `TracePropagation` seam, because which tracer to use is the application's decision |
+
+#### `A.class` names a node, it does not mean "this class"
+
+A node's name is its class's simple name unless you give it one. So `A.class` in an edge
+means **the node called A**, and writing the same class twice does not produce two nodes, it
+produces one:
+
+```java
+.from(Validate.class).to(Validate.class)
+// DagException: graph order-flow is not acyclic: Validate -> Validate
+```
+
+That is refused at `compile()` rather than at run time, and the message says what it really
+is: one node with an edge to itself.
+
+**To use one class as two steps, name them.** A graph that validates on the way in and
+validates again after enrichment wants one bean and two nodes:
+
+```java
+CompiledGraph flow = dag.bind(StateGraph.create("order-flow")
+        .node("Validate", Check.class)          // one class
+        .node("Recheck",  Check.class)          // two nodes
+        .from("Validate").to(Enrich.class)
+        .from(Enrich.class).to("Recheck")
+        .retry("Recheck", 2)                    // each carries its own settings
+        .entry("Validate")
+        .compile());
+```
+
+Named nodes are referred to by string everywhere a class would do: `from`, `to`, `caseOf`,
+`retry`, `local`, `entry`, and `RunResult.statusOf(...)`. Mixing the two is fine, and
+`Check.class` still means the node called `Check`.
+
+Two consequences worth knowing before you reach for this:
+
+| | |
+|---|---|
+| **One name cannot be two classes** | `node("X", A.class)` then `node("X", B.class)` is refused at build time, naming both classes. A name is the node's identity, and quietly letting the second win would mean the graph you drew is not the graph that runs |
+| **A node is not told its own name** | `execute(GraphState)` receives the state and nothing else, so two nodes of one class cannot behave differently by name. Let the difference come from a channel (`state.contains("enriched")`), which suits the state model, or write two small subclasses. Dispatch is by class name, so both nodes run on the **same bean instance**: like any Spring bean, it must be stateless |
 
 #### The definition, stored and read back
 
 `flow.render()` writes the graph out; `load(text, catalog)` reads it back. This is
-`SettlementFlowBestPractice` verbatim, which is the shape a workflow takes in a database
-column:
+`SettlementFlowBestPractice` verbatim, written by Jackson, which is the shape a workflow
+takes in a database column:
 
 ```json
 {
-  "graph": "daily-settlement",
-  "entries": ["LoadMerchants"],
-  "inputs": ["day", "dryRun"],
-  "channels": [
-    {"name": "steps", "reducer": "concatList"},
-    {"name": "payouts", "reducer": "writeOnce"},
-    {"name": "total", "reducer": "writeOnce"}
-  ],
-  "nodes": [
-    {"name": "LoadMerchants", "type": "com.acme.settlement.LoadMerchants", "kind": "node", "entry": true, "local": false, "trigger": "ALL", "retries": 0},
-    {"name": "ComputePayouts", "type": "com.acme.settlement.ComputePayouts", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
-    {"name": "Total", "type": "com.acme.settlement.Total", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
-    {"name": "TransferFunds", "type": "com.acme.settlement.TransferFunds", "kind": "node", "entry": false, "local": true, "trigger": "ALL", "retries": 2},
-    {"name": "ArchiveOnly", "type": "com.acme.settlement.ArchiveOnly", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
-    {"name": "FlagForOperator", "type": "com.acme.settlement.FlagForOperator", "kind": "node", "entry": false, "local": false, "trigger": "ALL", "retries": 0},
-    {"name": "Archive", "type": "com.acme.settlement.Archive", "kind": "node", "entry": false, "local": false, "trigger": "ANY", "retries": 0}
-  ],
-  "edges": [
-    {"from": "Total", "to": "TransferFunds", "kind": "conditional", "condition": "ON_SUCCESS", "branch": "0"},
-    {"from": "Total", "to": "ArchiveOnly", "kind": "conditional", "condition": "ON_SUCCESS", "branch": "else"},
-    {"from": "LoadMerchants", "to": "ComputePayouts", "kind": "plain", "condition": "ON_SUCCESS"},
-    {"from": "ComputePayouts", "to": "Total", "kind": "plain", "condition": "ON_SUCCESS"},
-    {"from": "TransferFunds", "to": "FlagForOperator", "kind": "plain", "condition": "ON_FAILURE"},
-    {"from": "TransferFunds", "to": "Archive", "kind": "plain", "condition": "ON_SUCCESS"},
-    {"from": "ArchiveOnly", "to": "Archive", "kind": "plain", "condition": "ON_SUCCESS"}
-  ],
-  "conditionals": [
-    {"sources": ["Total"], "form": "predicate", "expression": null,
-     "predicates": ["#total != null and #total > 0"],
-     "branches": [{"key": "0", "targets": ["TransferFunds"]}], "else": ["ArchiveOnly"]}
-  ]
+  "graph" : "daily-settlement",
+  "entries" : [ "LoadMerchants" ],
+  "inputs" : [ "day", "dryRun" ],
+  "channels" : [ {
+    "name" : "steps",
+    "reducer" : "concatList"
+  }, {
+    "name" : "payouts",
+    "reducer" : "writeOnce"
+  }, {
+    "name" : "total",
+    "reducer" : "writeOnce"
+  } ],
+  "nodes" : [ {
+    "name" : "LoadMerchants",
+    "type" : "com.acme.settlement.LoadMerchants",
+    "kind" : "node",
+    "entry" : true,
+    "local" : false,
+    "trigger" : "ALL",
+    "retries" : 0
+  }, {
+    "name" : "ComputePayouts",
+    "type" : "com.acme.settlement.ComputePayouts",
+    "kind" : "node",
+    "entry" : false,
+    "local" : false,
+    "trigger" : "ALL",
+    "retries" : 0
+  }, {
+    "name" : "Total",
+    "type" : "com.acme.settlement.Total",
+    "kind" : "node",
+    "entry" : false,
+    "local" : false,
+    "trigger" : "ALL",
+    "retries" : 0
+  }, {
+    "name" : "TransferFunds",
+    "type" : "com.acme.settlement.TransferFunds",
+    "kind" : "node",
+    "entry" : false,
+    "local" : true,
+    "trigger" : "ALL",
+    "retries" : 2
+  }, {
+    "name" : "ArchiveOnly",
+    "type" : "com.acme.settlement.ArchiveOnly",
+    "kind" : "node",
+    "entry" : false,
+    "local" : false,
+    "trigger" : "ALL",
+    "retries" : 0
+  }, {
+    "name" : "FlagForOperator",
+    "type" : "com.acme.settlement.FlagForOperator",
+    "kind" : "node",
+    "entry" : false,
+    "local" : false,
+    "trigger" : "ALL",
+    "retries" : 0
+  }, {
+    "name" : "Archive",
+    "type" : "com.acme.settlement.Archive",
+    "kind" : "node",
+    "entry" : false,
+    "local" : false,
+    "trigger" : "ANY",
+    "retries" : 0
+  } ],
+  "edges" : [ {
+    "from" : "Total",
+    "to" : "TransferFunds",
+    "kind" : "conditional",
+    "condition" : "ON_SUCCESS",
+    "branch" : "0"
+  }, {
+    "from" : "Total",
+    "to" : "ArchiveOnly",
+    "kind" : "conditional",
+    "condition" : "ON_SUCCESS",
+    "branch" : "else"
+  }, {
+    "from" : "LoadMerchants",
+    "to" : "ComputePayouts",
+    "kind" : "plain",
+    "condition" : "ON_SUCCESS"
+  }, {
+    "from" : "ComputePayouts",
+    "to" : "Total",
+    "kind" : "plain",
+    "condition" : "ON_SUCCESS"
+  }, {
+    "from" : "TransferFunds",
+    "to" : "FlagForOperator",
+    "kind" : "plain",
+    "condition" : "ON_FAILURE"
+  }, {
+    "from" : "TransferFunds",
+    "to" : "Archive",
+    "kind" : "plain",
+    "condition" : "ON_SUCCESS"
+  }, {
+    "from" : "ArchiveOnly",
+    "to" : "Archive",
+    "kind" : "plain",
+    "condition" : "ON_SUCCESS"
+  } ],
+  "conditionals" : [ {
+    "sources" : [ "Total" ],
+    "form" : "predicate",
+    "expression" : null,
+    "predicates" : [ "#total != null and #total > 0" ],
+    "branches" : [ {
+      "key" : "0",
+      "targets" : [ "TransferFunds" ]
+    } ],
+    "else" : [ "ArchiveOnly" ]
+  } ]
 }
 ```
 
@@ -420,7 +552,8 @@ unchanged. Three things about `resume` are worth knowing before relying on it:
 |---|---|
 | **A skipped node is not in `completed()`** | A skip is worked out, not something that happened. Storing one and restoring it would freeze it: a step skipped because the run failed above it would stay skipped after the failure was fixed, and the resumed run would finish having done nothing while looking healthy. Left out, it is recomputed, and a conditional on a restored node is evaluated again and passes over the same branch |
 | **A failed node is** | As FAILED, so resuming carries on down the compensation path exactly as the first run did. Removing it from the map first is how you say "try that step again" |
-| **A node interrupted mid-flight runs again** | It never finished, so it is not in the record. Whether that is safe is the question `retry(...)` asks, with the same answer: make the node idempotent, or key the outside call on something derived rather than generated |
+| **A node interrupted mid-flight runs again** | It never finished, so it is not in the record |
+| **And so does one that finished without its row landing** | The record is written by `onNodeFinished`, which runs on the coordinating instance. A node that ran, reported back, and whose row was not yet written when that instance died is a step that **happened** and is **not in the record**. Resuming is therefore **at-least-once, not exactly-once**, and no arrangement of this engine changes that: an effect outside the process cannot be made atomic with a row inside it. A lookup pays nothing for that; a payment pays twice, which is what `NodeContext.idempotencyKey()` is for |
 
 **Waiting, timers and human steps** are the same answer in a different shape, and they do
 not need an API here: cut the graph in two, and let whatever knows when to continue (a

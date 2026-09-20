@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A day's settlement, end to end.
@@ -263,7 +264,7 @@ public class SettlementFlowBestPractice {
      */
     public record SettlementReport(String runId, String day, Map<String, Long> payouts,
                                    long total, boolean settled, String stoppedAt,
-                                   java.util.Set<String> recovered, GraphState state,
+                                   Set<String> recovered, GraphState state,
                                    Map<String, NodeStatus> completed, String description) {
     }
 

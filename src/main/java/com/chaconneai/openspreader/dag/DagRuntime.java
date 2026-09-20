@@ -62,12 +62,24 @@ import java.util.concurrent.ExecutorService;
  * @since 12/09/2026
  */
 public record DagRuntime(ProcessingPool pool, NodeDispatcher local,
-                         ExecutorService localExecutor, GraphRenderer renderer) {
+                         ExecutorService localExecutor, GraphRenderer renderer,
+                         DagStats stats, RunRegistry runs, TracePropagation tracing) {
 
     public DagRuntime {
         if (pool == null) {
             throw new IllegalArgumentException("a DagRuntime needs a ProcessingPool");
         }
+        // Both are bookkeeping the engine keeps for itself, so a runtime built by hand gets
+        // them without having to know they exist
+        stats = stats == null ? new DagStats() : stats;
+        runs = runs == null ? new RunRegistry() : runs;
+        tracing = tracing == null ? TracePropagation.logContext() : tracing;
+    }
+
+    /** The four-argument form, for a runtime built by hand. */
+    public DagRuntime(ProcessingPool pool, NodeDispatcher local, ExecutorService localExecutor,
+                      GraphRenderer renderer) {
+        this(pool, local, localExecutor, renderer, null, null, null);
     }
 
     /**

@@ -171,6 +171,33 @@
 			<version>2.0.12</version>
 			<optional>true</optional>
 		</dependency>
+		<!--
+		  The DAG engine's definition format. Both are standard equipment in a Spring Boot
+		  application (Jackson for HTTP message conversion, SnakeYAML for application.yml),
+		  so naming them here costs nothing in practice. Optional all the same: an
+		  application that never writes a graph out never needs either.
+		-->
+		<dependency>
+			<groupId>tools.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.yaml</groupId>
+			<artifactId>snakeyaml</artifactId>
+			<optional>true</optional>
+		</dependency>
+		<!--
+		  Optional, like every other one here, and only for the DAG engine's HttpGraphNode:
+		  spring-web carries RestClient. It does not reach an application that does not
+		  already have it, and without it the engine uses the JDK's own HttpClient, which
+		  is the default anyway.
+		-->
+		<dependency>
+			<groupId>org.springframework</groupId>
+			<artifactId>spring-web</artifactId>
+			<optional>true</optional>
+		</dependency>
 
 	</dependencies>
 

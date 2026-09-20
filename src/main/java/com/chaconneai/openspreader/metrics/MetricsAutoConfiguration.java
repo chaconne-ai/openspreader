@@ -18,6 +18,7 @@ package com.chaconneai.openspreader.metrics;
 import com.chaconneai.openspreader.concurrent.ExecutorServiceHolder;
 import com.chaconneai.spreader.GossipCluster;
 import com.chaconneai.openspreader.cache.CacheService;
+import com.chaconneai.openspreader.dag.ProcessingDag;
 import com.chaconneai.openspreader.pooling.PoolService;
 import com.chaconneai.openspreader.scheduling.MultiProcessingTaskStats;
 import com.chaconneai.openspreader.rpc.RpcService;
@@ -265,17 +266,22 @@ public class MetricsAutoConfiguration {
                 ObjectProvider<BarrierService> barrier,
                 ObjectProvider<SemaphoreService> semaphore,
                 ObjectProvider<ExchangerService> exchanger,
-                ObjectProvider<RpcService> rpc) {
+                ObjectProvider<RpcService> rpc,
+                ObjectProvider<ProcessingDag> dag) {
+            // The engine rather than its counters: DagStats is not a bean of its own, it
+            // belongs to the runtime, and asking for the facade keeps that arrangement here
+            ProcessingDag engine = dag.getIfAvailable();
             ComponentMeterBinder binder = new ComponentMeterBinder(
                     cache.getIfAvailable(), mutex.getIfAvailable(),
                     pool.getIfAvailable(), scheduled.getIfAvailable(),
                     latch.getIfAvailable(), barrier.getIfAvailable(),
                     semaphore.getIfAvailable(), exchanger.getIfAvailable(),
-                    rpc.getIfAvailable());
+                    rpc.getIfAvailable(), engine == null ? null : engine.stats());
             log.info("Component observability bound to Micrometer: spreader.cache.* / "
                     + "spreader.mutex.* / spreader.pool.* / spreader.scheduled.* / "
                     + "spreader.latch.* / spreader.barrier.* / spreader.semaphore.* / "
-                    + "spreader.exchanger.* / spreader.rpc.*");
+                    + "spreader.exchanger.* / spreader.rpc.*"
+                    + (engine == null ? "" : " / spreader.dag.*"));
             return binder;
         }
 
