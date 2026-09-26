@@ -69,8 +69,8 @@ public class OrderFlowBestPractice {
      * per request and, worse, would turn a graph that is wrong into a run-time error rather
      * than a startup error.
      */
-    public OrderFlowBestPractice(ProcessingDag dagger) {
-        this.flow = dagger.bind(StateGraph.create("order-flow")
+    public OrderFlowBestPractice(ProcessingDag dag) {
+        this.flow = dag.bind(StateGraph.create("order-flow")
 
                 // ------------------------------------------------------
                 // Channels: how data merges when branches touch it
@@ -235,8 +235,8 @@ public class OrderFlowBestPractice {
 
         private final CompiledGraph inner;
 
-        public Fulfilment(ProcessingDag dagger) {
-            this.inner = dagger.bind(StateGraph.create("fulfilment")
+        public Fulfilment(ProcessingDag dag) {
+            this.inner = dag.bind(StateGraph.create("fulfilment")
                     .channel("steps", Reducers.concatList())
                     .from(PickStock.class).to(PackBox.class, PrintLabel.class)
                     .from(PackBox.class, PrintLabel.class).to(HandToCourier.class)

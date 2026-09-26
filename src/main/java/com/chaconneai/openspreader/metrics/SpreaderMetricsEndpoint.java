@@ -193,15 +193,10 @@ public class SpreaderMetricsEndpoint {
     /**
      * Cluster-level state: split brain, whether it is running, and whether collection is on.
      *
-     * <h2>Why split brain has to be here and not in health alone</h2>
-     * It used to appear only in {@code /actuator/health}, and <b>conditionally</b> at that --
-     * where nothing had ever split, the fields did not exist. So {@code everSplit()}'s javadoc
-     * said "alert on this" while no outlet handed the number over <b>dependably</b>: not
-     * Prometheus, and not this endpoint.
-     *
-     * <p>A split brain is usually momentary, and once it heals {@code occurrences} is the only
-     * trace left. A field that appears only when something is wrong cannot be alerted on -- a
-     * monitoring system needs a number that is always there and normally 0.
+     * <p>Split brain is reported here, and unconditionally. It is usually momentary, and once
+     * it heals {@code occurrences} is the only trace left. A field that appears only when
+     * something is wrong cannot be alerted on: a monitoring system needs a number that is
+     * always there and normally 0.
      */
     private Map<String, Object> cluster() {
         SplitBrainStatus split = metrics.splitBrainStatus();

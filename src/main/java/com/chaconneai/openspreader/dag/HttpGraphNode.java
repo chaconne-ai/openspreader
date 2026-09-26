@@ -73,16 +73,6 @@ import java.util.Map;
  *       safe for the far side to recognise</td></tr>
  * </table>
  *
- * <h2>Why this one is in the library when the rule is to build nothing</h2>
- * Because it builds nothing. It reads settings and hands a request to a client somebody else
- * wrote. There is no connection pooling here, no retry logic and no timeout machinery:
- * retries and compensation belong to the graph, and the timeout is one line of whichever
- * client is underneath.
- *
- * <p>What it does add is the <b>only part an application cannot write for itself without
- * help</b>: a node that knows which step it is. That is {@link NodeContext}, and this class
- * is mostly a demonstration that it is enough.
- *
  * <h2>Which client, and how to use another</h2>
  * This class is abstract, and everything above is common to every implementation: the
  * settings, the placeholders, the idempotency key, what counts as a failure. <b>Only
@@ -90,29 +80,27 @@ import java.util.Map;
  *
  * <ul>
  *   <li>{@link RestClientGraphNode} is the one that ships, and what the auto-configuration
- *       registers. Spring's {@code RestClient} is <b>synchronous, as a node is</b>, and it
- *       goes through the application's own request factory, so the timeouts, proxy,
- *       interceptors and observations already configured there apply here too</li>
+ *       registers. Spring's {@code RestClient} is <b>synchronous, as a node is</b>, and it goes
+ *       through the application's own request factory, so the timeouts, proxy, interceptors and
+ *       observations configured there apply here too</li>
  *   <li><b>Your own</b>: extend this class, implement {@code send}, and declare it as a bean
  *       named {@code httpGraphNode}. The auto-configuration stands aside when one is already
- *       there. That is the way to use OkHttp, Apache HttpClient, a signed-request wrapper,
- *       or a stub in a test, and it is why this class is abstract rather than final</li>
+ *       there, which is the way to use OkHttp, Apache HttpClient, a signed-request wrapper or a
+ *       stub in a test</li>
  * </ul>
  *
- * <p>{@code spring-web} is an <b>optional</b> dependency of this library: it is not added to
- * an application that does not already have it. Such an application gets no
- * {@code httpGraphNode} bean, and writing one is the paragraph above.
+ * <p>{@code spring-web} is an <b>optional</b> dependency, so an application that does not
+ * already have it gets no {@code httpGraphNode} bean and writes its own as above.
  *
  * <h2>Declare it local</h2>
  * {@code .local(...)}. The call leaves the process either way, so handing it to a peer first
  * adds a hop, a serialisation and a second thing that can fail. The exception is a step that
- * fans out into many calls at once, where spreading them across the cluster is the point.
+ * fans out into many calls at once, where spreading them is the point.
  *
- * <h2>What it deliberately does not do</h2>
+ * <h2>What it does not do</h2>
  * No JSON parsing: the response body reaches a channel as text, and what it means is the
- * application's business. No authentication beyond headers you set. No per-call circuit
- * breaking. Each of those would mean choosing a library on behalf of every user of this
- * engine, and each has a better home in the application.
+ * application's business. No authentication beyond headers you set, and no per-call circuit
+ * breaking. Each would mean choosing a library on behalf of every user of this engine.
  *
  * @author Fred Feng
  * @version 1.0.0

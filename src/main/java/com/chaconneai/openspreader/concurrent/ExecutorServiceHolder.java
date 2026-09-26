@@ -37,102 +37,42 @@ import java.util.function.Supplier;
  * <b>The single place every thread pool is maintained.</b> No component creates one of its
  * own; each takes what it needs from here, by purpose.
  *
- * <h2>Why they are gathered in one place</h2>
- * Each service used to create and close its own: seven services, seven sets. Spring could not
- * see them at all -- there was no talking of lifecycle, metrics or overriding -- and the
- * shutdown order was left to whatever each service's {@code close()} did. The more practical
- * problem was that answering "how many threads does this process start, and what for?" meant
- * reading seven constructors.
- *
  * <h2>Taken by purpose, not by pool</h2>
- * The only public surface is a set of {@code forXxx()} accessors, and <b>a caller does not know
- * whether the pool it received is shared</b>.
+ * The only public surface is a set of {@code forXxx()} accessors, and <b>a caller does not
+ * know whether the pool it received is shared</b>. That is deliberate: sharing is an
+ * implementation detail of this class, so changing it later touches this class alone.
  *
- * <p>That is deliberate: sharing is an implementation detail of this class. They are separate
- * today for reasons of rejection policy; merging them tomorrow -- putting several
- * single-threaded channels onto one shared pool with serial lanes, say -- changes this class
- * alone, and <b>not a line of the seven services</b>. Were the services to hold an
- * {@code ExecutorService} directly, any such merge would be a breaking change across modules.
+ * <h2>Two separations that are not negotiable</h2>
+ * <b>Scheduling and execution cannot share a pool.</b>
+ * {@code ScheduledThreadPoolExecutor} hard-codes {@code DelayedWorkQueue}, whose capacity is
+ * unbounded and cannot be changed. Handling inbound messages on it would turn a bounded queue
+ * back into an unbounded one, and back-pressure would be gone.
  *
- * <h2>Why scheduling and execution cannot share a pool</h2>
- * They are maintained in the same class but <b>are not the same pool</b>, and that is a hard
- * constraint: {@code ScheduledThreadPoolExecutor} hard-codes {@code DelayedWorkQueue}, whose
- * <b>capacity is unbounded and cannot be changed</b>. Handling inbound messages on it would
- * turn a queue that had just been bounded back into an unbounded one -- the rejection policy
- * would never fire, and back-pressure would be gone entirely.
+ * <p><b>{@link #forRenewal()} and {@link #forMaintenance()} cannot share one either.</b>
+ * Renewal keeps lock and semaphore leases alive and takes microseconds; maintenance sweeps
+ * expiry and cache keys and can hold a thread for hundreds of milliseconds. Queued behind a
+ * sweep, a renewal misses its deadline, the leader reclaims the lock, and <b>the holder knows
+ * nothing about it and is still inside the critical section</b>. That is among the gravest
+ * failures this library can have.
  *
- * <h2>Why the two schedulers cannot be merged either</h2>
- * {@link #forRenewal()} and {@link #forMaintenance()} <b>tolerate delay by orders of magnitude
- * differently</b>:
+ * <h2>Rejection policy is why the inbound channels are separate</h2>
+ * {@link #forPoolInbound()} and {@link #forCacheInbound()} discard when full, so neither can
+ * starve the other. {@link #forRpcInbound()} and {@link #forMapReduceInbound()} reject
+ * instead, because the caller needs the overload answer to take its fallback, and dropping one
+ * intermediate result would make an aggregate silently wrong. {@link #forCacheSync()} and the
+ * three notify channels are single-threaded: they send network messages and block, so sharing
+ * one thread would let a connect timeout on one side stall the others.
+ * {@link #forRecursiveTasks()} is ForkJoin, because a task that joins subtasks inside
+ * {@code compute()} needs work-stealing to avoid exhausting itself.
  *
- * <table border="1">
- *   <caption>The two kinds of periodic task</caption>
- *   <tr><th></th><th>{@link #forRenewal()}</th><th>{@link #forMaintenance()}</th></tr>
- *   <tr><td>What it runs</td><td><b>Lease renewal</b> for locks and semaphores</td>
- *       <td>Expiry sweeps, idle cleanup, cache maintenance, access reporting</td></tr>
- *   <tr><td>What lateness costs</td>
- *       <td><b>A missed renewal releases the lock while the application still believes it holds
- *           it</b></td>
- *       <td>Cleanup happens a little later, with no consequence at all</td></tr>
- *   <tr><td>Time per run</td><td>Microseconds -- a few requests sent</td>
- *       <td>Possibly hundreds of milliseconds, sweeping a few hundred thousand cache keys</td></tr>
- * </table>
+ * <h2>The lifecycle belongs to the container</h2>
+ * Pools are closed in {@link #destroy()}, but created <b>on first use</b> rather than in
+ * {@link #afterPropertiesSet()}. Components can be switched off individually, and creating
+ * everything at startup would leave a switched-off component holding a resident pool nothing
+ * submits to. So "the pool exists" means "something really uses it", and a jstack reflects
+ * which features are actually enabled.
  *
- * <p>What putting them together costs is concrete: cache maintenance is sweeping a few hundred
- * thousand keys and holding a thread for hundreds of milliseconds while renewal queues behind
- * it -- the lease expires, the leader reclaims the lock, <b>and the holder knows nothing about
- * it and is still working inside the critical section</b>. This is among the gravest failures
- * this library has.
- *
- * <h2>Which execution pools are currently separate</h2>
- * <table border="1">
- *   <caption>Each channel's policy</caption>
- *   <tr><th>Channel</th><th>What a full queue does</th><th>Why it is not yet merged</th></tr>
- *   <tr><td>{@link #forPoolInbound()}</td><td>Discards</td>
- *       <td>Merged with the cache, cache overload would starve task dispatch</td></tr>
- *   <tr><td>{@link #forCacheInbound()}</td><td>Discards</td><td>As above, in reverse</td></tr>
- *   <tr><td>{@link #forRpcInbound()}</td>
- *       <td><b>Rejects</b>, so the calling side takes its fallback the moment it receives the
- *           overload answer</td>
- *       <td>The rejection policy is a <b>property of the pool</b> and its meaning differs from
- *           the other two, so a merge would have to unify them</td></tr>
- *   <tr><td>{@link #forMapReduceInbound()}</td>
- *       <td><b>Rejects</b>: dropping one intermediate result makes the aggregate <b>silently
- *           wrong</b></td>
- *       <td>The rejection policy matches RPC's, but it runs <b>user code</b> of unpredictable
- *           duration: merged, one slow job could occupy every RPC inbound thread</td></tr>
- *   <tr><td>{@link #forCacheSync()}</td><td>Single-threaded</td>
- *       <td>It sends a full snapshot in chunks and may hold a thread for a long time</td></tr>
- *   <tr><td>{@link #forLatchNotify()}</td><td>Single-threaded</td>
- *       <td rowspan="3">Notification sends network messages and blocks. Sharing one thread,
- *       one side stuck on a connect timeout stops the other entirely</td></tr>
- *   <tr><td>{@link #forBarrierNotify()}</td><td>Single-threaded</td></tr>
- *   <tr><td>{@link #forExchangerNotify()}</td><td>Single-threaded</td></tr>
- *   <tr><td>{@link #forRecursiveTasks()}</td><td>ForkJoin</td>
- *       <td>A recursive task joins subtasks inside {@code compute()}, and only work-stealing
- *           avoids exhausting itself</td></tr>
- * </table>
- *
- * <p>The real answer for those last four single-threaded channels is <b>one shared bounded
- * pool with a serial lane per component</b>: the lane keeps a component's internal order, the
- * threads are shared, and there is no head-of-line blocking. That is the next step, and thanks
- * to the accessors above it will not affect any caller.
- *
- * <h2>The lifecycle belongs entirely to the container</h2>
- * It implements {@link InitializingBean} and {@link DisposableBean}, so pools are created in
- * {@link #afterPropertiesSet()} and closed in {@link #destroy()}.
- *
- * <p>More precisely: a pool is <b>not created even in {@code afterPropertiesSet()}</b> but on
- * first use. Components can be switched off individually
- * ({@code spring.spreader.multiprocessing.cache.enabled=false} and the like), and creating
- * everything at startup would leave a switched-off component holding a <b>resident thread
- * pool</b> nothing would ever submit to.
- *
- * <p>Creating on demand has a further benefit: "the pool exists" becomes equivalent to "some
- * component really uses it", and the thread count in a jstack reflects which features are
- * actually enabled. {@link #destroy()} then walks only what was created, with no null checks.
- *
- * <p>A service <b>must never</b> close a pool from here -- one service shutting down should not
+ * <p>A service <b>must never</b> close a pool from here: one service shutting down should not
  * take another's threads with it.
  *
  * @author Fred Feng
