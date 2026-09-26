@@ -13,41 +13,25 @@
 	<version>1.0.0-SNAPSHOT</version>
 	<name>openspreader</name>
 	<description>
-		A complete set of multi-process programming components for Spring Boot:
-		distributed locks, semaphores, latches and barriers, a process pool, a
-		replicated cache, cluster-wide scheduling, RPC and MapReduce-style aggregation,
-		all on top of the embedded spreader cluster.
+		Multi-process programming components for Spring Boot: distributed locks,
+		semaphores, latches, barriers, exchangers, a process pool, a replicated cache
+		with Bloom filters, cluster-wide scheduling, RPC, MapReduce-style aggregation
+		and DAG orchestration, all on the embedded spreader cluster.
 
-		Each component keeps the shape of its java.util.concurrent counterpart and
-		spans every instance of the application instead of one JVM. A ProcessingMutex is
-		acquired and released like a ReentrantLock; a ProcessingSemaphore hands out
-		permits the same way; the process pool takes a method call on one instance and
-		runs it on another. The cluster itself is spreader, running inside the same JVM
-		as the application's beans, so there is no Redis, no ZooKeeper and no message
-		broker in the picture.
+		Each component keeps the shape of its java.util.concurrent counterpart but spans
+		every instance of the application instead of one JVM: a ProcessingMutex is
+		acquired and released like a ReentrantLock. The cluster runs inside the same JVM
+		as the application's beans, so there is no Redis, no ZooKeeper and no broker.
+		Every component has two scopes, one confined to a single application and one
+		spanning the cluster. The cache replicates operations rather than data and every
+		node holds a full replica, so reads never leave the process.
 
-		Every component has two scopes: one confined to instances of the same
-		application, one spanning everything on the cluster port. The cache replicates by
-		shipping operations rather than data, so a setbit on a 100MB bitmap costs one
-		datagram and a cluster-wide Bloom filter becomes practical; every node holds a
-		full replica, so reads never leave the process. Scheduled tasks fire on every
-		instance but run on exactly one. The process pool over @MultiProcessingCall and
-		remote calls over @RpcClient, which routes by application name rather than by
-		URL, are plain annotations on plain beans.
+		Nothing is enabled by default: each component is switched on through properties,
+		so adding this starter to a running service changes nothing until one is asked for.
 
-		Every failure surfaces as ProcessingException, split by cause rather than summed
-		into one rate. Metrics go to Prometheus and cluster health joins the actuator
-		endpoints, carrying each member's HTTP address, so one node's health response is
-		enough to reach any other.
-
-		The limits of the underlying cluster are inherited rather than hidden:
-		leadership is not consensus, and the cache is memory only. Under a network
-		partition two sides can each hold a leader, and a full cluster restart starts
-		from empty. If double execution is unacceptable, this is not the tool.
-
-		Nothing is enabled by default. Every component is switched on through
-		properties, so adding this starter to a running service changes nothing until
-		one of them is asked for.
+		Inherited limits, stated rather than hidden: election is pre-emptive rather than
+		consensus-based, so under a network partition two sides can each hold a leader,
+		and the cache is memory only.
 	</description>
 	<url>https://github.com/chaconne-ai/openspreader</url>
 	<inceptionYear>2026</inceptionYear>
@@ -91,7 +75,6 @@
 			<version>1.0.0-SNAPSHOT</version>
 		</dependency>
 
-		<!-- spreader has no logging dependency of its own, so declare slf4j here -->
 		<dependency>
 			<groupId>org.slf4j</groupId>
 			<artifactId>slf4j-api</artifactId>
@@ -108,42 +91,19 @@
 			<artifactId>spring-boot-autoconfigure</artifactId>
 		</dependency>
 
-		<!--
-		  Generates META-INF/spring-configuration-metadata.json from the
-		  @ConfigurationProperties classes, so every property this starter exposes
-		  gets IDE completion, type info and the javadoc as its description.
-
-		  Without it the four properties classes (111 fields in total) are invisible
-		  to the IDE: no completion, no documentation, and a typo in application.yml
-		  fails silently instead of being flagged as an unknown key.
-
-		  optional + provided-style: it is an annotation processor, needed only while
-		  compiling this module. It must not leak onto any downstream classpath.
-		-->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-configuration-processor</artifactId>
 			<optional>true</optional>
 		</dependency>
 
-		<!--
-		  Optional, so downstream projects don't inherit them:
-		  - kryo: only when serialization=KRYO. Missing it fails fast at startup
-		    with a clear message rather than a later NoClassDefFoundError.
-		  - spring-retry: only when using RPC (@RpcClient).
-		-->
-		<!--
-		  Observability, also optional:
-		  - micrometer-core: exports metrics to Prometheus.
-		  - actuator: adds the /actuator/spreader endpoint and cluster health.
-		  Without either, MetricsService is still injectable and fully usable.
-		-->
-		<!--
-		  Optional as well: the WebServerInitializedEvent that tells the node its real
-		  HTTP ports lives in this module, which a non-web application does not have.
-		  The listener that uses it is behind @ConditionalOnClass, so a batch job or a
-		  command-line tool starts exactly as before.
-		-->
+		<!-- Optional: kryo only when serialization=KRYO (missing it fails fast at
+		     startup with a clear message), spring-retry only for @RpcClient. -->
+		<!-- Optional observability: micrometer exports to Prometheus, actuator adds
+		     /actuator/spreader. Without either, MetricsService still works. -->
+		<!-- Optional: carries the event that tells a node its real HTTP ports. The
+		     listener is behind @ConditionalOnClass, so a non-web application is
+		     unaffected. -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-web-server</artifactId>
@@ -171,12 +131,8 @@
 			<version>2.0.12</version>
 			<optional>true</optional>
 		</dependency>
-		<!--
-		  The DAG engine's definition format. Both are standard equipment in a Spring Boot
-		  application (Jackson for HTTP message conversion, SnakeYAML for application.yml),
-		  so naming them here costs nothing in practice. Optional all the same: an
-		  application that never writes a graph out never needs either.
-		-->
+		<!-- The DAG definition format. Optional: only needed to write a graph out or
+		     read one back. Both ship with Spring Boot anyway. -->
 		<dependency>
 			<groupId>tools.jackson.core</groupId>
 			<artifactId>jackson-databind</artifactId>
@@ -187,12 +143,7 @@
 			<artifactId>snakeyaml</artifactId>
 			<optional>true</optional>
 		</dependency>
-		<!--
-		  Optional, like every other one here, and only for the DAG engine's HttpGraphNode:
-		  spring-web carries RestClient. It does not reach an application that does not
-		  already have it, and without it the engine uses the JDK's own HttpClient, which
-		  is the default anyway.
-		-->
+
 		<dependency>
 			<groupId>org.springframework</groupId>
 			<artifactId>spring-web</artifactId>
@@ -203,11 +154,8 @@
 
 	<build>
 		<plugins>
-			<!--
-			  This is a library, not an application. repackage must stay off:
-			  it would move classes into BOOT-INF/classes, where nothing
-			  depending on this jar can find them.
-			-->
+			<!-- This is a library: repackage must stay off, or classes move into
+			     BOOT-INF/classes where dependents cannot find them. -->
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
@@ -226,14 +174,10 @@
 							<goal>compile</goal>
 						</goals>
 						<configuration>
-							<!--
-							  Once annotationProcessorPaths is configured explicitly,
-							  processors on the classpath are no longer discovered
-							  automatically. So configuration-processor has to be listed
-							  here as well: adding it to dependencies alone is not enough,
-							  and nothing reports an error; the metadata file is simply
-							  never generated.
-							-->
+							<!-- Configuring annotationProcessorPaths stops classpath
+							     discovery, so configuration-processor must be listed here
+							     too. Left out, no error appears and the metadata file is
+							     simply never generated. -->
 							<annotationProcessorPaths>
 								<path>
 									<groupId>org.projectlombok</groupId>
@@ -280,14 +224,8 @@
 				</executions>
 			</plugin>
 
-			<!--
-			  Javadoc jar for publishing. doclint is off: the docs here are written
-			  for people reading the source, and blocking a release over a missing
-			  @param tag helps nobody.
-
-			  failOnError is off too, because Lombok-generated getters carry no
-			  javadoc and optional dependencies may be absent at doc time.
-			-->
+			<!-- Javadoc jar for publishing. doclint is off so a missing @param tag
+			     cannot block a release. -->
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-javadoc-plugin</artifactId>
@@ -326,16 +264,12 @@
 	</build>
 
 	<!--
-	  Signing lives in a profile, so it runs only when a release is actually being
-	  published: mvn deploy -Prelease
-	  Why not in the build section: every ordinary build reaches the verify phase
-	  (install does, and so does the whole test matrix inside Docker), and signing
-	  there means every one of them needs a GPG key present. The container has none.
+	  Signing is in a profile so ordinary builds need no GPG key: install and the
+	  Docker test matrix both reach verify, and the container has no key.
 
-	  The price of this choice, stated plainly: forgetting -Prelease publishes
-	  UNSIGNED artifacts. Central rejects an unsigned release, so a real release
-	  fails loudly; a SNAPSHOT does not require signatures and would go up quietly.
-	  So the rule is simple: releases are always deployed with -Prelease.
+	  The catch: forgetting -Prelease publishes UNSIGNED artifacts. Central rejects
+	  an unsigned release loudly, but a SNAPSHOT goes up quietly. So always
+	  release with: mvn deploy -Prelease
 	-->
 	<profiles>
 		<profile>
@@ -348,13 +282,9 @@
 						<artifactId>maven-gpg-plugin</artifactId>
 						<version>3.2.8</version>
 
-						<!--
-						  Loopback pinentry. The plugin runs gpg in batch mode, and with no
-						  graphical pinentry installed gpg has nowhere to ask for the passphrase,
-						  so it fails with "Inappropriate ioctl for device". Loopback makes gpg
-						  take the passphrase from Maven instead, given as -Dgpg.passphrase on
-						  the command line or set in settings.xml.
-						-->
+						<!-- Loopback pinentry: gpg runs in batch mode here, so without it
+						     it fails with "Inappropriate ioctl for device". The passphrase
+						     comes from -Dgpg.passphrase or settings.xml. -->
 						<configuration>
 							<gpgArguments>
 								<arg>--pinentry-mode</arg>

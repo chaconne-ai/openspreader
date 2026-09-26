@@ -15,7 +15,7 @@
  */
 package com.chaconneai.openspreader.example.bloom;
 
-import com.chaconneai.openspreader.bloom.ProcessingBloomFilter;
+import com.chaconneai.openspreader.cache.ProcessingBloomFilter;
 import com.chaconneai.openspreader.cache.ProcessingCache;
 
 import java.nio.charset.StandardCharsets;

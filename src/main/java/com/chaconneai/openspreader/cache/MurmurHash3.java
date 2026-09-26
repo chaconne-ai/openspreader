@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.chaconneai.openspreader.bloom;
+package com.chaconneai.openspreader.cache;
 
 /**
  * The 128-bit x64 variant of MurmurHash3.

@@ -13,9 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.chaconneai.openspreader.bloom;
+package com.chaconneai.openspreader.cache;
 
-import com.chaconneai.openspreader.cache.ProcessingCache;
 
 /**
  * A Bloom filter built on the cluster cache: one process {@code put}s a value in, and every
