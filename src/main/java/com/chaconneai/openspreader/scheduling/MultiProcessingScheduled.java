@@ -38,72 +38,37 @@ import java.lang.annotation.Target;
  * <h2>How it works</h2>
  * Before each firing it takes a
  * {@link com.chaconneai.openspreader.sync.ProcessingMutex}: taking it runs the task, and
- * failing to take it <b>skips the round</b> -- it does not queue, which would only pile tasks
+ * failing to take it <b>skips the round</b> rather than queueing, which would only pile tasks
  * up.
  *
- * <p>The lock <b>is not released the moment the task finishes</b>; it is held down to the end
- * of the round -- see {@link #lockAtLeastMs()}. Without that, a task finishing in a few
- * milliseconds releases the lock, another instance takes it at once, and the same round runs
- * several times, which amounts to no exclusion at all.
+ * <p>The lock <b>is not released when the task finishes</b>; it is held to the end of the
+ * round, see {@link #lockAtLeastMs()}. Without that, a task finishing in milliseconds releases
+ * the lock, another instance takes it at once, and the same round runs several times, which is
+ * no exclusion at all.
  *
- * <h2>Every instance still schedules; those that miss the lock simply spin once</h2>
- * All three instances' schedulers <b>fire on time as usual</b>; the one holding the lock runs
- * the body and the other two return. What is saved is the repeated execution of the body, not
- * the scheduling. Each spin costs one network round trip for the lock -- milliseconds -- and
- * an immediate return.
+ * <p>Every instance's scheduler still fires on time. The one holding the lock runs the body and
+ * the others return after one network round trip for the lock. What is saved is the repeated
+ * execution of the body, not the scheduling.
  *
- * <p>So with a light body and dense scheduling -- a round every 100 milliseconds, say -- that
- * spinning is a fair share of the cost, and such a case is worth reconsidering: is exclusion
- * across instances really needed?
- *
- * <h2>Which machine the task actually lands on</h2>
- * Once the cooldown passes everyone races again, but <b>the odds are not even</b>: the leader
- * takes the lock by consulting a register in its own memory, while every other node needs a
- * network round trip -- measured at about 1.5 milliseconds' difference. The leader gets there
- * first every round. The upshot:
- *
- * <table border="1">
- *   <caption>Where tasks actually run</caption>
- *   <tr><th>Task granularity</th><th>Where it lands</th></tr>
- *   <tr><td>{@link Scope#CLUSTER}</td>
- *       <td><b>Fixed on the leader</b> -- the whole cluster races and the leader always
- *           wins</td></tr>
- *   <tr><td>{@link Scope#APPLICATION}, where this application is the leader's</td>
- *       <td><b>Fixed on the leader</b></td></tr>
- *   <tr><td>{@link Scope#APPLICATION}, other applications</td>
- *       <td><b>Rotates</b> among their own instances -- none of them is the leader, their
- *           latencies match, and the competition is fair. But it is only "whoever's scheduling
- *           point comes first takes it", not strict round-robin; two instances have been
- *           measured splitting 8 to 2</td></tr>
- * </table>
- *
- * <p>So the leader's machine additionally carries "its own application's tasks plus every
- * cluster-scoped task". With light tasks -- sending notifications, refreshing a cache,
- * scanning a small table -- that is of no consequence; with heavy ones, note that this machine
- * also hosts the lock register, so the load compounds.
+ * <h2>Which instance it lands on</h2>
+ * Not evenly distributed, and not meant to be. The leader takes the lock by reading a register
+ * in its own memory while everyone else needs a round trip, about 1.5 milliseconds' difference,
+ * so the leader wins nearly every race. In practice cluster-scoped tasks are effectively
+ * pinned to the leader, and application-scoped tasks rotate among that application's instances
+ * only when none of them is the leader, loosely rather than round-robin.
  *
  * <p>Tasks move to the new leader on a change of leadership, without interruption. This
- * mechanism <b>does not guarantee</b> "always runs on the same machine"; stickiness needs
- * another approach.
+ * <b>does not guarantee</b> "always the same machine"; stickiness needs another approach.
  *
  * <h2>Do not use "am I the leader" instead</h2>
- * {@code cluster.isLeader()} is <b>cluster-level</b> -- one process in the whole cluster holds
- * the cluster port, and it does not distinguish applications. Where an order service and a
- * reporting service share a cluster, the leader may happen to be a reporting service instance,
- * and a scheduled task in the order service guarded by it would <b>never run at all</b>,
- * because no instance of the order service is the leader.
+ * {@code cluster.isLeader()} is <b>cluster-level</b> and does not distinguish applications.
+ * Where an order service and a reporting service share a cluster, the leader may be a reporting
+ * service instance, and an order service task guarded by {@code isLeader()} would <b>never run
+ * at all</b>. A scheduled task wants "one of the instances of this application", which means
+ * taking a lock, and that is what this annotation does inside.
  *
- * <p>The leader means "who holds that port", which has nothing to do with "who should run this
- * application's tasks". A scheduled task wants "one of the instances of this application", and
- * that means taking a lock:
- * <pre>{@code
- * boolean got = mutex.tryAcquire();
- * if (got) { doTheWork(); } else { skipThisRound(); }
- * }</pre>
- * which is precisely what this annotation does inside.
- *
- * <h2>What happens when execution outlasts the lease</h2>
- * Nothing goes wrong. The lock service renews the lease while it is held, so a task may run as
+ * <h2>Running longer than the lease</h2>
+ * Nothing goes wrong: the lock service renews the lease while it is held, so a task may run as
  * long as it likes. Only a crashed process, or one stuck badly enough to stop renewing, loses
  * the lock to someone else.
  *

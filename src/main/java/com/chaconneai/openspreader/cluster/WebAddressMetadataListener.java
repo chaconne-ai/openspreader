@@ -31,16 +31,11 @@ import java.util.Map;
  * but the member list.
  *
  * <h2>Why it cannot be written by hand</h2>
- * The gossip port is not the HTTP port. Gossip tells everyone {@code host:22000}, while the
- * application answers on {@code 8080} under some context path -- and nothing in the member
- * list says which. So "go and look at that node's health" cannot be done from inside the
- * cluster at all, which is exactly what is wanted when one node is misbehaving and something
- * has to look at it from outside.
- *
- * <p>Writing the port into {@code spring.spreader.metadata} by hand does not work either:
- * with {@code server.port=0}, or several instances on one machine, or a container mapping
- * the port, <b>the real port is not known until the web server has bound</b>. Only the
- * actual bound port is worth publishing.
+ * The gossip port is not the HTTP port: gossip tells everyone {@code host:22000} while the
+ * application answers on {@code 8080} under some context path, and nothing in the member list
+ * says which. Putting it in {@code spring.spreader.metadata} by hand does not work either,
+ * because with {@code server.port=0}, several instances on one machine, or a container mapping
+ * the port, <b>the real port is not known until the web server has bound</b>.
  *
  * <h2>What is published</h2>
  * <table border="1">
@@ -74,31 +69,27 @@ import java.util.Map;
  * // -> http://10.0.0.7:8081/actuator/health
  * }</pre>
  *
- * <p>Which keys belong in that expression depends on where the actuator sits: on a
- * management port of its own it hangs off {@link #MANAGEMENT_BASE_PATH} and the
- * application's own {@link #CONTEXT_PATH} and {@link #SERVLET_PATH} play no part; sharing
- * the server port, it sits behind both of them. What is published here is the raw
- * configuration -- the assembling is the reader's, because only the reader knows which
- * endpoint it is after.
+ * <p>Which keys belong in that expression depends on where the actuator sits: on a management
+ * port of its own it hangs off {@link #MANAGEMENT_BASE_PATH} and the application's own
+ * {@link #CONTEXT_PATH} and {@link #SERVLET_PATH} play no part; sharing the server port, it
+ * sits behind both. What is published is the raw configuration, and the assembling is the
+ * reader's, because only the reader knows which endpoint it is after.
  *
- * <h2>Why the ports are told apart by event and the paths by configuration</h2>
- * Spring Boot starts a management context of its own only when the management port differs,
- * and that context publishes a {@link WebServerInitializedEvent} of its own, which
- * propagates up to the parent context and so reaches this listener too. The two events are
- * told apart by {@code getApplicationContext().getServerNamespace()} --
- * {@code "management"} for the management context -- and are handled <b>independently of
- * each other's order</b>: each merges its own keys into whatever metadata is already there,
- * because the child context's event usually arrives <i>before</i> the parent's.
+ * <h2>Ports come from the event, paths from the configuration</h2>
+ * A bound port of 0 is not the port in use, so a port has to come from
+ * {@link WebServerInitializedEvent}. Paths are not rewritten at bind time, so the
+ * configuration is the whole truth about them.
  *
- * <p>A port has to come from the event because a bound port of 0 is not the port in use. The
- * paths have no such problem: nothing rewrites them at bind time, so the configuration is
- * the whole truth about them.
+ * <p>Spring Boot starts a management context of its own only when the management port differs,
+ * and that context publishes an event of its own which propagates up and reaches this listener
+ * too. The two are told apart by {@code getServerNamespace()} being {@code "management"}, and
+ * each merges its own keys into whatever metadata is already there, so <b>the order does not
+ * matter</b>: the child context's event usually arrives before the parent's.
  *
- * <h2>Why this goes into metadata rather than a new field on the node</h2>
- * Metadata is precisely the place for "things about this node that the framework itself does
- * not care about". A field would have to travel in the protocol, and every node would carry
- * four values of interest only to whoever is looking at HTTP. Metadata already gossips out,
- * and an application is free to add anything of its own beside these.
+ * <p>This goes into metadata rather than a new field on the node because metadata already
+ * gossips out and is exactly the place for "things about this node the framework itself does
+ * not care about". A protocol field would make every node carry values of interest only to
+ * whoever is looking at HTTP.
  *
  * @author Fred Feng
  * @version 1.0.0

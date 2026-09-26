@@ -180,6 +180,7 @@ public class ApplicationClusterAutoConfiguration {
                 .nodeName(resolveApplicationName(p, springApplicationName))
                 .bindHost(p.getBindHost())
                 .clusterPort(p.getPort())
+                .leaderEligible(p.isLeaderEligible())
                 .priority(p.getAdvanced().getPriority())
                 .loadBalancer(switch (p.getLoadBalancer()) {
                     case RANDOM -> LoadBalancer.random();

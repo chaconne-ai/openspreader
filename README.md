@@ -53,7 +53,7 @@ public class ReportService {
 | Process pool | `ProcessingPool`, or `@MultiProcessingCall` on any bean method | a work queue |
 | Cluster scheduling | `@MultiProcessingScheduled` | ShedLock |
 | RPC | `@RpcClient` | Feign for internal calls |
-| MapReduce | `ProcessingMapReduce`, or `@MultiProcessingMapReduce` | a batch framework, for jobs of this size |
+| MapReduce | `ProcessingMapReduce`, with a `MapReduceJob` bean | a batch framework, for jobs of this size |
 | DAG workflows | `ProcessingDag`, building a `StateGraph` | a workflow engine, for graphs of this size |
 
 ## What to expect in practice
@@ -67,7 +67,7 @@ public class ReportService {
 | **The process pool tells you which side you are on** | A call runs locally when no peer is available and behaves exactly as before, so a single instance is a valid deployment. `spreader_pool_remote_ratio` says whether work is genuinely being spread or you have a local thread pool with extra steps. |
 | **Failures arrive as one exception type** | Everything surfaces as `ProcessingException`, split by cause rather than summed into a single rate, so a timeout and a serialization error never look alike on a dashboard. Business exceptions from your own remote code are passed through unwrapped. |
 | **Observability without extra work** | Metrics register with Micrometer and reach `/actuator/prometheus`; cluster health joins the actuator endpoints and carries each member's HTTP address, so one node's health response is enough to reach any other. |
-| **Inherited limits** | Leadership is not consensus, and the cache is memory only. Under a network partition two sides can each hold a leader, and a full cluster restart starts from empty. Both are stated in [Limits](#limits) rather than discovered later. |
+| **Inherited limits** | Election is pre-emptive rather than consensus-based, and the cache is memory only. Under a network partition two sides can each hold a leader, and a full cluster restart starts from empty. Both are stated in [Limits](#limits) rather than discovered later. |
 
 ## Is this the right tool?
 
@@ -76,7 +76,7 @@ public class ReportService {
 | Several instances of a Spring Boot service that need a lock, a shared counter, or a job that runs once | **Yes. This is the case it was built for** |
 | You want a read-heavy shared cache and can tolerate a few milliseconds of staleness | Yes. Reads are local and roughly a thousand times cheaper than writes |
 | You need the cache to survive a full cluster restart | No. It is memory only, by decision. Use Redis if the data must outlive the processes |
-| "This must never run twice, **ever**": money moves, or a ledger is written | **No. Use Raft**, or a database transaction |
+| "This must never run twice, **ever**": money moves, or a ledger is written | **No.** That needs consensus-based election, or a database transaction |
 | You are not on Spring Boot | Use [`spreader`](https://github.com/chaconne-ai/spreader) directly, the library underneath this one |
 | You already operate Redis and ZooKeeper for other reasons | Probably not worth the swap. The operational cost you would save is already being paid |
 
@@ -94,6 +94,7 @@ public class ReportService {
   - [Workflows: the DAG engine](#workflows-the-dag-engine)
 - [Performance](#performance-and-what-it-tells-you-about-the-design)
 - [Recommended configuration](#recommended-configuration)
+  - [Which application may become the leader](#which-application-may-become-the-leader)
 - [Observability](#observability)
 - [How this is verified](#how-this-is-verified)
 - [Examples](#examples)
@@ -161,7 +162,6 @@ repositories {
 |---|---|
 | **Java** | 17 or later |
 | **Spring Boot** | 4.1, built and tested against it; see the note below |
-| **Runtime dependencies** | [`spreader`](https://github.com/chaconne-ai/spreader), plus Spring Boot itself |
 | **Optional** | Micrometer for Prometheus; Kryo for faster serialisation; Netty, MINA or Grizzly for an alternative transport |
 | **Ports** | one cluster port, identical on every node (22000 by default), plus one work port per node |
 
@@ -226,15 +226,24 @@ runs locally, so a single instance behaves exactly as before.
 **`@RpcClient`**: call a method on a *different* application:
 
 ```java
-@RpcClient(name = "inventory-service", fallback = InventoryFallback.class)
+@SpringBootApplication
+@EnableRpcClients(basePackages = "com.example.client")   // switches on the scan
+public class Application { }
+
+@RpcClient(serviceId = "inventory-service",
+           timeout = 3000,
+           maxConcurrent = 50,                           // in-flight ceiling, fail fast when full
+           fallback = InventoryFallback.class)
 public interface InventoryClient {
-    @RpcMethod
+
     int available(String sku);
 }
 ```
 
 Routing is by application name, not URL. Nodes come and go; there is nothing to
-update.
+update. The server side needs a bean with a matching method carrying
+`@MultiProcessingCall`. Set `maxConcurrent`: without it, requests pile up locally
+when the downstream slows, and what falls over is your own process.
 
 **`@MultiProcessingScheduled`**: the job fires on every instance, but only one runs it:
 
@@ -311,9 +320,7 @@ different instances, and a single instance is still a valid deployment.
 | **Parallel merges are ordered by node name** | Not by arrival, so the same graph gives the same answer on a different day |
 | **A step can be a whole graph** | `SubGraph` is a node that is itself a graph, which is how a workflow stays readable past a dozen steps |
 | **A step can be outside this application** | `ExternalNode` plus `local(...)` calls an HTTP API from the coordinating instance rather than shipping the call to a peer |
-| **The definition can be stored** | `JsonRenderer` and `YamlRenderer` write a graph out and read it back, with a `GraphCatalog` supplying the node classes. Nothing is resolved by `Class.forName` |
-| **And drawn** | `flow.toMermaid()` for a README, `result.toMermaid()` for a finished run with each node coloured by what became of it |
-| **Persistence is the application's, and the seams are here** | Every run has an identity, every callback carries it, each node is reported as it finishes, and `resume(state, completed, runId)` carries on without re-running what already ran |
+| **The definition can be stored, and drawn** | `JsonRenderer` and `YamlRenderer` write a graph out and read it back, with a `GraphCatalog` supplying the node classes and nothing resolved by `Class.forName`. `flow.toMermaid()` draws the graph, `result.toMermaid()` draws a finished run with each node coloured by what became of it |
 | **Retries can back off** | `retry(Charge.class, 2, Backoff.exponential(Duration.ofMillis(200)))`, with jitter where fifty runs would otherwise retry in the same instant. The waiting costs no thread: the coordinator's loop simply wakes no later than the next attempt falls due |
 | **A run can be stopped** | `dag.cancel(runId)` stops dispatching and stops waiting. It does not reach into another replica to interrupt work already running there, because that node may be halfway through a payment. What finished is still reported and still resumable |
 | **It reports to Micrometer like everything else** | `spreader.dag.*`: runs started, succeeded, failed, cancelled, in flight, plus nodes run, failed, skipped, dispatched, local, and retries. Nothing per node name, which is how a cardinality problem starts |
@@ -361,9 +368,11 @@ Two consequences worth knowing before you reach for this:
 
 #### The definition, stored and read back
 
-`flow.render()` writes the graph out; `load(text, catalog)` reads it back. This is
-`SettlementFlowBestPractice` verbatim, written by Jackson, which is the shape a workflow
-takes in a database column:
+`flow.render()` writes the graph out; `load(text, catalog)` reads it back. Below is
+`SettlementFlowBestPractice` as Jackson writes it, which is the shape a workflow takes in a
+database column. It is **abridged to one example of each shape**: two of its seven nodes and
+two of its seven edges, chosen as the ones the table underneath refers to. Run the example to
+see the whole thing.
 
 ```json
 {
@@ -376,35 +385,8 @@ takes in a database column:
   }, {
     "name" : "payouts",
     "reducer" : "writeOnce"
-  }, {
-    "name" : "total",
-    "reducer" : "writeOnce"
   } ],
   "nodes" : [ {
-    "name" : "LoadMerchants",
-    "type" : "com.acme.settlement.LoadMerchants",
-    "kind" : "node",
-    "entry" : true,
-    "local" : false,
-    "trigger" : "ALL",
-    "retries" : 0
-  }, {
-    "name" : "ComputePayouts",
-    "type" : "com.acme.settlement.ComputePayouts",
-    "kind" : "node",
-    "entry" : false,
-    "local" : false,
-    "trigger" : "ALL",
-    "retries" : 0
-  }, {
-    "name" : "Total",
-    "type" : "com.acme.settlement.Total",
-    "kind" : "node",
-    "entry" : false,
-    "local" : false,
-    "trigger" : "ALL",
-    "retries" : 0
-  }, {
     "name" : "TransferFunds",
     "type" : "com.acme.settlement.TransferFunds",
     "kind" : "node",
@@ -412,22 +394,6 @@ takes in a database column:
     "local" : true,
     "trigger" : "ALL",
     "retries" : 2
-  }, {
-    "name" : "ArchiveOnly",
-    "type" : "com.acme.settlement.ArchiveOnly",
-    "kind" : "node",
-    "entry" : false,
-    "local" : false,
-    "trigger" : "ALL",
-    "retries" : 0
-  }, {
-    "name" : "FlagForOperator",
-    "type" : "com.acme.settlement.FlagForOperator",
-    "kind" : "node",
-    "entry" : false,
-    "local" : false,
-    "trigger" : "ALL",
-    "retries" : 0
   }, {
     "name" : "Archive",
     "type" : "com.acme.settlement.Archive",
@@ -444,36 +410,10 @@ takes in a database column:
     "condition" : "ON_SUCCESS",
     "branch" : "0"
   }, {
-    "from" : "Total",
-    "to" : "ArchiveOnly",
-    "kind" : "conditional",
-    "condition" : "ON_SUCCESS",
-    "branch" : "else"
-  }, {
-    "from" : "LoadMerchants",
-    "to" : "ComputePayouts",
-    "kind" : "plain",
-    "condition" : "ON_SUCCESS"
-  }, {
-    "from" : "ComputePayouts",
-    "to" : "Total",
-    "kind" : "plain",
-    "condition" : "ON_SUCCESS"
-  }, {
     "from" : "TransferFunds",
     "to" : "FlagForOperator",
     "kind" : "plain",
     "condition" : "ON_FAILURE"
-  }, {
-    "from" : "TransferFunds",
-    "to" : "Archive",
-    "kind" : "plain",
-    "condition" : "ON_SUCCESS"
-  }, {
-    "from" : "ArchiveOnly",
-    "to" : "Archive",
-    "kind" : "plain",
-    "condition" : "ON_SUCCESS"
   } ],
   "conditionals" : [ {
     "sources" : [ "Total" ],
@@ -650,6 +590,8 @@ up remote calls.
 spring.spreader.name=order-cluster
 spring.spreader.ip-addresses=10.0.1.10,10.0.1.11,10.0.1.12
 spring.spreader.advertise-host=10.0.1.10          # in containers: what peers can dial
+# set on an application that should join but never lead, such as an API facade
+spring.spreader.leader-eligible=false
 
 # --- turn on only what you use ---
 spring.spreader.multiprocessing.mutex.enabled=true
@@ -719,6 +661,44 @@ Not "unavailable". It depends on the operation, deliberately:
 You do not need to gate traffic at the application layer. Each path handles the
 gap in the way that matches its own semantics, and gating would not work
 anyway, since `isLeader()` is itself indeterminate during the transition.
+
+### Which application may become the leader
+
+Several applications often share one cluster name so that they can see each
+other: the one doing the work, plus an API facade, a batch job, a console. They
+are not equally suited to leading. The leader holds the lock and permit
+registers and the authoritative cache copy, which wants a long lived, evenly
+loaded instance with several replicas. A facade that scales to zero overnight and
+restarts on every deploy will take the port just as readily, and what you get is
+a change of leader on every deployment.
+
+```properties
+# per application, and it is the Spring Boot application that this is about,
+# not the individual instance
+spring.spreader.leader-eligible=false
+```
+
+Such a node joins normally, gossips normally and takes dispatched work normally.
+It never claims the cluster port, it is skipped when the others work out whose
+turn it is to take over, and it advertises this through member metadata so the
+others do not have to guess. Older nodes that predate the flag read it as a key
+they do not recognise, so a rolling upgrade is safe.
+
+Setting it on **every** application is a misconfiguration, and one worth
+understanding rather than guarding against: the leader is also the rendezvous
+point for discovery, since discovery knocks on the cluster port and the holder of
+that port is the leader. With nobody holding it the members cannot find each
+other either, and each node sits alone with a member list of one. The engine
+reports this as a periodic warning instead of promoting someone anyway, which
+would override an explicit configuration. Starting one eligible application
+restores the leader and the member views together, with no restart of the
+followers.
+
+Until then, components that need a leader fail rather than pretend: `acquire`
+returns false instead of handing out a lock nobody else recognises. That is the
+same set of deliberate degradations as [What happens during an
+election](#what-happens-during-an-election), with one difference that matters:
+an election ends, this does not until someone changes the configuration.
 
 ### Serialization
 
@@ -921,9 +901,12 @@ in a particular way: it is off the main path, so a change that alters its
 
 ## Limits
 
-- **Leadership is not consensus.** Under a partition both sides can elect a
-  leader; it heals when the partition does. If a job must *never* run twice, use
-  a system with a consensus protocol.
+- **Election is pre-emptive, not consensus-based.** Under a partition both sides
+  can elect a leader; it heals when the partition does. The two are different
+  routes rather than different grades: pre-emptive election suits coordination
+  where a repeat is wasteful, and work where a repeat causes real harm belongs
+  with a consensus protocol, or behind a fencing token, or in a database
+  transaction.
 - **The cache is a cache.** Every node holds a full replica in heap. It is not a
   database and not a durable store.
 - **Eviction is local.** Nodes can disagree about which keys are resident.
