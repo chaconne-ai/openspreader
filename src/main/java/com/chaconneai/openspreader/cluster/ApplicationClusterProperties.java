@@ -87,6 +87,40 @@ public class ApplicationClusterProperties {
      */
     private String applicationName;
 
+    /**
+     * Whether this application may become the cluster's leader. <b>True by default.</b>
+     *
+     * <pre>
+     * spring.spreader.leader-eligible=false
+     * </pre>
+     *
+     * <h2>What it is for</h2>
+     * One cluster often holds several applications: the one that does the work, and an API
+     * facade, a batch worker, a console. They share a cluster so they can see one another,
+     * but <b>they are not equally suited to leading it</b>. The leader keeps the lock
+     * register, the permit register and the cache's authoritative copy, so it wants an
+     * instance that is long-lived, evenly loaded and deployed in numbers. A facade that scales
+     * to zero overnight, or is restarted on every release, is a poor choice, and leaving it in
+     * the running only buys a change of leader on every deployment.
+     *
+     * <p>Set it false in that application's own configuration and it joins, sees everyone,
+     * uses every component, and <b>never contends for the cluster port</b>. It is a property
+     * of the application rather than a list kept somewhere central, because the application
+     * is the thing that knows what it is.
+     *
+     * <h2>It changes nothing else</h2>
+     * Not membership, not gossip, not who may call whom, and <b>not</b> whether work can be
+     * dispatched to it. A follower-only instance is an ordinary member in every respect but
+     * one. Its own {@code applicationName} still groups it for
+     * {@code membersOf(name)}, so "send only to the order service" works as before.
+     *
+     * <p><b>Somebody has to be eligible.</b> A cluster where every application sets this false
+     * has no leader, and every component that needs one stops working. That is a configuration
+     * mistake, and it is reported as a warning rather than quietly corrected: correcting it
+     * would mean overriding what was explicitly asked for.
+     */
+    private boolean leaderEligible = true;
+
     /** The interface to listen on. All interfaces by default. */
     private String bindHost = "0.0.0.0";
 

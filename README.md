@@ -650,6 +650,8 @@ up remote calls.
 spring.spreader.name=order-cluster
 spring.spreader.ip-addresses=10.0.1.10,10.0.1.11,10.0.1.12
 spring.spreader.advertise-host=10.0.1.10          # in containers: what peers can dial
+# set on an application that should join but never lead, such as an API facade
+spring.spreader.leader-eligible=false
 
 # --- turn on only what you use ---
 spring.spreader.multiprocessing.mutex.enabled=true
@@ -719,6 +721,44 @@ Not "unavailable". It depends on the operation, deliberately:
 You do not need to gate traffic at the application layer. Each path handles the
 gap in the way that matches its own semantics, and gating would not work
 anyway, since `isLeader()` is itself indeterminate during the transition.
+
+### Which application may become the leader
+
+Several applications often share one cluster name so that they can see each
+other: the one doing the work, plus an API facade, a batch job, a console. They
+are not equally suited to leading. The leader holds the lock and permit
+registers and the authoritative cache copy, which wants a long lived, evenly
+loaded instance with several replicas. A facade that scales to zero overnight and
+restarts on every deploy will take the port just as readily, and what you get is
+a change of leader on every deployment.
+
+```properties
+# per application, and it is the Spring Boot application that this is about,
+# not the individual instance
+spring.spreader.leader-eligible=false
+```
+
+Such a node joins normally, gossips normally and takes dispatched work normally.
+It never claims the cluster port, it is skipped when the others work out whose
+turn it is to take over, and it advertises this through member metadata so the
+others do not have to guess. Older nodes that predate the flag read it as a key
+they do not recognise, so a rolling upgrade is safe.
+
+Setting it on **every** application is a misconfiguration, and one worth
+understanding rather than guarding against: the leader is also the rendezvous
+point for discovery, since discovery knocks on the cluster port and the holder of
+that port is the leader. With nobody holding it the members cannot find each
+other either, and each node sits alone with a member list of one. The engine
+reports this as a periodic warning instead of promoting someone anyway, which
+would override an explicit configuration. Starting one eligible application
+restores the leader and the member views together, with no restart of the
+followers.
+
+Until then, components that need a leader fail rather than pretend: `acquire`
+returns false instead of handing out a lock nobody else recognises. That is the
+same set of deliberate degradations as [What happens during an
+election](#what-happens-during-an-election), with one difference that matters:
+an election ends, this does not until someone changes the configuration.
 
 ### Serialization
 
