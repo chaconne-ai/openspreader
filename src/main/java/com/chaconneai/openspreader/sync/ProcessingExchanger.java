@@ -30,19 +30,9 @@ import java.util.concurrent.TimeoutException;
  * Batch empty = point.exchange(full, 30, TimeUnit.SECONDS);  // hand over full, take back empty
  * }</pre>
  *
- * <h2>Choosing between this and the other synchronisers</h2>
- * <ul>
- *   <li>{@link ProcessingCountDownLatch} -- <b>one-shot</b>, waiters and counters are
- *       different parties. "Wait for five things to finish"</li>
- *   <li>{@link ProcessingCyclicBarrier} -- <b>N parties align</b>, round after round, and
- *       carry nothing with them. "Five parties align once per round"</li>
- *   <li>This interface -- <b>exactly two parties meet and each takes something away</b>.
- *       "Hand over a full buffer and take back an empty one"</li>
- * </ul>
- *
- * <p>The distinguishing feature is the <b>item</b>. A barrier tells the parties that
- * everyone has arrived; an exchanger moves data between them, and the rendezvous is only the
- * means of doing it.
+ * <p>What sets it apart from {@link ProcessingCountDownLatch} and
+ * {@link ProcessingCyclicBarrier} is the <b>item</b>: they only tell the parties that everyone
+ * has arrived, while this moves data between exactly two of them.
  *
  * <h2>A party is a thread</h2>
  * As in the JDK, one {@link #exchange} call is one party. Two threads in one process may
@@ -62,23 +52,18 @@ import java.util.concurrent.TimeoutException;
  * permits it too.
  *
  * <h2>Timing out never loses an item</h2>
- * This is the one place the semantics deliberately depart from a plain reading of the JDK.
- * A pairing can happen on the leader in the instant between this party giving up and its
- * cancellation arriving; by then the partner has already gone away with this party's item.
- * Rather than throw and drop the incoming half, {@link #exchange(Object, long, TimeUnit)}
- * <b>returns successfully</b> in that case, a little over its deadline.
- *
- * <p>An interrupt is handled the same way: the item is returned and the thread's interrupt
- * flag is set again, so the caller still notices at its next blocking call. See
- * {@link #exchange(Object)}.
+ * A deliberate departure from the JDK's semantics. A pairing can land on the leader in the
+ * instant between this party giving up and its cancellation arriving, and by then the partner
+ * has left with this party's item. Rather than throw and drop the incoming half,
+ * {@link #exchange(Object, long, TimeUnit)} <b>returns successfully</b>, a little over its
+ * deadline. An interrupt is handled the same way, with the interrupt flag set again so the
+ * caller still notices at its next blocking call.
  *
  * <h2>What not to use it for</h2>
- * Its safety does not exceed the strength of "there is one leader". Under a network
- * partition each side has a leader of its own and pairs within itself, so two parties that
- * both expected to meet can end up meeting someone else. And a change of leader loses any
- * exchange that had paired but not yet been collected -- an exchange is a rendezvous, not a
- * transaction. Where an item must not be lost under any circumstances, put it in a queue
- * with storage behind it.
+ * Its safety is only as strong as "there is one leader". Under a partition each side pairs
+ * within itself, so two parties expecting each other can meet someone else, and a change of
+ * leader loses any exchange paired but not yet collected. An exchange is a rendezvous, not a
+ * transaction: where an item must never be lost, use a queue with storage behind it.
  *
  * @param <V> the type of item exchanged
  *

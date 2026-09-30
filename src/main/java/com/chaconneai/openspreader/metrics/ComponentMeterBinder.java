@@ -192,6 +192,23 @@ public class ComponentMeterBinder implements MeterBinder {
         num(registry, "spreader.cache.evicted",
                 "keys evicted in total; quick growth means the capacity is too small",
                 cache, c -> stat(c, "evicted"));
+        num(registry, "spreader.cache.keys.local", "keys held in this process's memory",
+                cache, c -> stat(c, "localKeyCount"));
+        num(registry, "spreader.cache.external", "whether an external store is configured, 1 or 0",
+                cache, c -> boolStat(c, "externalStore"));
+        num(registry, "spreader.cache.spilled",
+                "keys moved to the external store rather than dropped. Against "
+                        + "spreader.cache.evicted it says how much of the eviction was a loss: "
+                        + "with no external store the two never meet, since spilled stays at 0",
+                cache, c -> stat(c, "spilled"));
+        num(registry, "spreader.cache.spill.failures",
+                "keys dropped because the external store refused them. Non-zero means it is "
+                        + "unreachable and the cache is losing data again, which is the one "
+                        + "thing configuring a store was meant to stop",
+                cache, c -> stat(c, "spillFailures"));
+        num(registry, "spreader.cache.keys.external",
+                "keys held in the external store, 0 when none is configured",
+                cache, c -> stat(c, "externalKeyCount"));
         num(registry, "spreader.cache.ops.applied", "operations applied in total",
                 cache, c -> stat(c, "opsApplied"));
         num(registry, "spreader.cache.ops.sent", "operations broadcast in total",

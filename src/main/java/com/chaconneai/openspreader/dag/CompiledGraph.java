@@ -45,10 +45,12 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>A node unreachable from the entry.</b> Nearly always a typo or a forgotten edge,
  *       and a node that can never run is worth hearing about before the run rather than
  *       after</li>
- *   <li><b>Two parallel branches writing one channel with no reducer</b>, where the nodes
- *       declared {@link GraphNode#writes()}. Undeclared, the same conflict is caught at run
- *       time when the second write lands</li>
  * </ol>
+ *
+ * <p>One thing it deliberately does <b>not</b> catch is two parallel branches writing one
+ * channel with no reducer: which nodes write which channels is not declared anywhere, so it
+ * cannot be known before the run. That conflict is detected at run time, when the second write
+ * lands, and fails the run rather than letting one write vanish.
  *
  * <h2>Running it needs a runtime; rendering it does not</h2>
  * {@link #toMermaid()} and {@link #toDot()} work on a bare compiled graph, so a graph can be
@@ -439,8 +441,9 @@ public class CompiledGraph {
      *
      * <p><b>One output, not one method per format.</b> The four built-in renderers describe
      * the same graph, so a method each would invite an application to emit two of them and
-     * then have to keep both in step wherever they land. Which one this is comes from
-     * {@code spring.spreader.multiprocessing.dag.renderer}; see {@link RendererType}.
+     * then have to keep both in step wherever they land. This one writes <b>JSON</b>; for any
+     * other format pass a {@link GraphRenderer} to {@link #render(GraphRenderer)}, and
+     * {@link RendererType} holds the ones that ship.
      *
      * <p>An unbound graph, one compiled purely for validation or in a unit test, has no
      * configuration to consult and renders as JSON. Rendering deliberately needs no cluster
@@ -461,7 +464,10 @@ public class CompiledGraph {
         return renderer.render(this, null);
     }
 
-    /** The configured renderer, or Mermaid when this graph is not bound to a runtime. */
+    /**
+     * The runtime's renderer, or JSON. The auto-configuration sets none, so in a Spring
+     * application this is JSON; a hand-built {@code DagRuntime} may supply one.
+     */
     GraphRenderer configuredRenderer() {
         return runtime == null || runtime.renderer() == null
                 ? RendererType.JSON.renderer()

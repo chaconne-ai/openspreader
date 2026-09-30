@@ -138,7 +138,17 @@ public class CacheService
     private static final long RESYNC_NUDGE_INTERVAL_MS = 200L;
 
     private final GossipCluster cluster;
-    private final CacheStore store = new CacheStore();
+    /** This process's memory. Snapshots, eviction and byte accounting are all its business. */
+    private final LocalCacheStore local = new LocalCacheStore();
+
+    /**
+     * Where reads and writes go. Without an external store this <b>is</b> {@link #local}, the
+     * same object, so nothing is wrapped and no call is added on the read path.
+     */
+    private final CacheStore store;
+
+    /** The composed store, or null when no external store is configured. */
+    private final CompositeCacheStore composite;
 
     /**
      * The replication scope: updates are multicast only to instances under this application
@@ -289,6 +299,12 @@ public class CacheService
 
     private final AtomicLong accessReported = new AtomicLong();
 
+    /** Keys moved to the external store rather than dropped. */
+    private final AtomicLong spilled = new AtomicLong();
+
+    /** Keys that had to be dropped because the external store would not take them. */
+    private final AtomicLong spillFailures = new AtomicLong();
+
     /**
      * Disk persistence; null when it is not configured.
      *
@@ -305,7 +321,7 @@ public class CacheService
      *                  in, so the container manages the lifecycle and Actuator can see it
      */
     public CacheService(GossipCluster cluster, CacheOptions options, ExecutorServiceHolder executors) {
-        this(cluster, options, executors, null);
+        this(cluster, options, executors, null, null);
     }
 
     /**
@@ -313,6 +329,16 @@ public class CacheService
      */
     public CacheService(GossipCluster cluster, CacheOptions options, ExecutorServiceHolder executors,
                         CachePersistence persistence) {
+        this(cluster, options, executors, persistence, null);
+    }
+
+    /**
+     * @param persistence disk persistence; {@code null} disables it
+     * @param external    where keys go when memory runs short; {@code null} keeps everything in
+     *                    memory and evicts as before, which is the default
+     */
+    public CacheService(GossipCluster cluster, CacheOptions options, ExecutorServiceHolder executors,
+                        CachePersistence persistence, CacheStore external) {
         this.persistence = persistence;
         this.cluster = cluster;
         this.options = options;
@@ -337,6 +363,10 @@ public class CacheService
         this.inbound = executors.forCacheInbound();
         this.syncExecutor = executors.forCacheSync();
         this.executors = executors;
+        // With no external store, store IS local: the same object, so nothing is wrapped and
+        // every path behaves exactly as it did before this was added
+        this.composite = external == null ? null : new CompositeCacheStore(local, external);
+        this.store = composite == null ? local : composite;
     }
 
     /**
@@ -385,7 +415,7 @@ public class CacheService
         }
         // Only LRU and LFU need access information; RANDOM and NONE switch it off, saving two
         // field writes on the read path
-        store.trackAccess(options.needsAccessTracking());
+        local.trackAccess(options.needsAccessTracking());
         syncReadReporting();
         broadcaster = daemon("cache-broadcast").newThread(this::broadcastLoop);
         broadcaster.start();
@@ -572,6 +602,18 @@ public class CacheService
                                    byte[] value, long arg) {
         evictIfExpiredLocked(op, key);
 
+        // A key that has been moved out is changed where it is, and <b>does not enter the
+        // replication stream</b>. The external store holds one copy that every node reads, so
+        // there is nothing to replicate; broadcasting would instead have each follower rebuild
+        // the key in its own memory, giving back the memory the move saved and leaving the
+        // nodes disagreeing about which side it is on. No version is consumed either, since
+        // versions order the memory replicas and this write touches none of them
+        if (composite != null && composite.isExternal(key)) {
+            CacheStore.Result result = composite.external().apply(op, key, field, value, arg);
+            opsApplied.incrementAndGet();
+            return new Executed(result, applied);
+        }
+
         // A pop must be resolved to a specific member on the leader first. Having each node pop
         // for itself would let the slightest difference in ordering pop different members,
         // forking the replicas on the spot with nothing reported
@@ -613,7 +655,7 @@ public class CacheService
      * should have gone.
      */
     private void evictIfExpiredLocked(CacheOp op, String key) {
-        if (op == CacheOp.CLEAR || key == null || !store.isExpired(key)) {
+        if (op == CacheOp.CLEAR || key == null || !local.isExpired(key)) {
             return;
         }
         long version = applied + 1;
@@ -751,7 +793,7 @@ public class CacheService
                         //
                         // Applying directly is safe: applied and epoch are untouched, the gap
                         // state is preserved, and when the full synchronisation arrives
-                        // store.restore() replaces the table wholesale -- this write is either
+                        // local.restore() replaces the table wholesale -- this write is either
                         // already in the snapshot, the leader having executed it, or overwritten
                         // by the correct version. So the fallback affects only the window before
                         // the synchronisation arrives, which is exactly the window in which the
@@ -919,7 +961,7 @@ public class CacheService
                 if (cluster.isLeader()) {
                     List<String> keys = msg.decodeAccessKeys();
                     for (String k : keys) {
-                        store.touch(k);
+                        local.touch(k);
                     }
                     accessReported.addAndGet(keys.size());
                 }
@@ -1050,7 +1092,7 @@ public class CacheService
             }
             snapshotEpoch = epoch;
             snapshotSeq = applied;
-            chunks = store.dump(snapshotChunkBytes);
+            chunks = local.dump(snapshotChunkBytes);
         }
         for (int i = 0; i < chunks.size(); i++) {
             CacheMessage chunk = CacheMessage.snapshot(msg.requestId(), snapshotEpoch,
@@ -1237,7 +1279,7 @@ public class CacheService
      */
     private boolean replayLocked(CacheOp op, String key, String field, byte[] value, long arg) {
         try {
-            store.apply(op, key, field, value, arg);
+            local.apply(op, key, field, value, arg);
             opsApplied.incrementAndGet();
             return true;
         } catch (RuntimeException e) {
@@ -1320,7 +1362,7 @@ public class CacheService
             // in between would act on the old data and then be overwritten by the new applied,
             // leaving the replica wrong
             synchronized (stateLock) {
-                store.restore(chunks);
+                local.restore(chunks);
                 epoch = assembly.epoch;
                 applied = assembly.seq;
                 // Anything from an old epoch, or already in the snapshot, is worth nothing
@@ -1335,7 +1377,7 @@ public class CacheService
             resyncCount.incrementAndGet();
             log.info("Full synchronisation complete ({}): source={}, epoch={}, version={}, "
                     + "keys={}",
-                    reason, source.label(), assembly.epoch, assembly.seq, store.keyCount());
+                    reason, source.label(), assembly.epoch, assembly.seq, local.keyCount());
             return true;
         } catch (ExecutionException | TimeoutException e) {
             log.debug("Pulling a snapshot from {} failed: {}", source.label(),
@@ -1459,7 +1501,7 @@ public class CacheService
      * forking the replicas.
      */
     private void sweepExpired(long now) {
-        List<String> expired = store.expiredKeys(now);
+        List<String> expired = local.expiredKeys(now);
         if (expired.isEmpty()) {
             return;
         }
@@ -1468,11 +1510,11 @@ public class CacheService
         // expired keys do not block the write path
         for (String key : expired) {
             synchronized (stateLock) {
-                if (!cluster.isLeader() || !store.isExpired(key)) {
+                if (!cluster.isLeader() || !local.isExpired(key)) {
                     continue;
                 }
                 long version = applied + 1;
-                store.apply(CacheOp.DEL, key, "", null, 0L);
+                local.apply(CacheOp.DEL, key, "", null, 0L);
                 applied = version;
                 enqueueLocked(version, CacheOp.DEL, key, "", null, 0L);
                 swept++;
@@ -1500,6 +1542,11 @@ public class CacheService
      * tens of thousands here would block the write path and flood the broadcast queue, so it is
      * spread over several rounds. The capacity is slightly exceeded meanwhile, which is of no
      * consequence for a cache.
+     *
+     * <p><b>With an external store configured this stops being a loss.</b> The key is written
+     * across before the memory copy is deleted, so memory stays inside its limits while the data
+     * remains readable. The DEL still goes out to every node, so all of them drop it from memory
+     * together and the replicas stay identical; a later read finds it outside.
      */
     private void evictIfOverLimitLocked() {
         if (!options.hasLimit() || options.evictionPolicy() == EvictionPolicy.NONE) {
@@ -1507,18 +1554,58 @@ public class CacheService
         }
         int budget = options.evictionBatch();
         int removed = 0;
+        int passed = 0;
         while (removed < budget && overLimit()) {
-            String victim = store.pickEvictionCandidate(
+            String victim = local.pickEvictionCandidate(
                     options.evictionPolicy(), options.evictionSamples());
             if (victim == null) {
                 break;
             }
+            // With an external store configured this is a move, not a loss: the data goes
+            // across first, and only then is the memory copy deleted below
+            // Two different reasons a key does not move, and they must not be confused:
+            // "should not" keeps it in memory, "could not" still has to free the memory
+            boolean moved = false;
+            boolean storeFailed = false;
+            if (composite != null) {
+                try {
+                    moved = composite.spill(victim);
+                } catch (RuntimeException e) {
+                    // The external store is unreachable. Eviction runs inside the write path,
+                    // so letting this out would turn "Redis is down" into "the cache rejects
+                    // writes", which is far worse than what it was configured to prevent.
+                    // Fall back to what happened before it existed: drop the key, and say so
+                    storeFailed = true;
+                    spillFailures.incrementAndGet();
+                    log.warn("Could not move key {} to the external store, so it is being "
+                            + "dropped as it would have been without one: {}",
+                            victim, e.toString());
+                }
+            }
+
+            if (composite != null && !moved && !storeFailed) {
+                // It was refused rather than failed: a bitmap, which is unusable over a network
+                // and so stays in memory. Deleting it anyway would put us back to losing data.
+                // Sampling is random, so another key is tried rather than this one again
+                if (++passed > budget) {
+                    log.warn("Over the limit (keys={}, bytes~{}) but nothing could be moved "
+                                    + "out this round. Bitmaps stay in memory by design, being "
+                                    + "unusable over a network. Raise max-bytes if this persists",
+                            local.keyCount(), local.approxBytes());
+                    return;
+                }
+                continue;
+            }
+
             long version = applied + 1;
-            CacheStore.Result r = store.apply(CacheOp.DEL, victim, "", null, 0L);
+            CacheStore.Result r = local.apply(CacheOp.DEL, victim, "", null, 0L);
             if (!r.flag()) {
                 // The sampled key was just removed by another operation; another is taken, and
                 // no version is consumed
                 continue;
+            }
+            if (moved) {
+                spilled.incrementAndGet();
             }
             applied = version;
             enqueueLocked(version, CacheOp.DEL, victim, "", null, 0L);
@@ -1529,10 +1616,10 @@ public class CacheService
             if (removed >= budget) {
                 log.warn("This round hit its cap of {} evictions without reaching the limits "
                         + "(keys={}, bytes~{}); it continues next round, {} evicted in total",
-                        budget, store.keyCount(), store.approxBytes(), total);
+                        budget, local.keyCount(), local.approxBytes(), total);
             } else {
                 log.debug("Evicted {} key(s); now keys={} bytes~{}, {} in total",
-                        removed, store.keyCount(), store.approxBytes(), total);
+                        removed, local.keyCount(), local.approxBytes(), total);
             }
         }
     }
@@ -1540,8 +1627,8 @@ public class CacheService
     private boolean overLimit() {
         long maxKeys = options.maxKeys();
         long maxBytes = options.maxBytes();
-        return (maxKeys > 0 && store.keyCount() > maxKeys)
-                || (maxBytes > 0 && store.approxBytes() > maxBytes);
+        return (maxKeys > 0 && local.keyCount() > maxKeys)
+                || (maxBytes > 0 && local.approxBytes() > maxBytes);
     }
 
     /**
@@ -1559,7 +1646,7 @@ public class CacheService
             if (leader == null) {
                 return;
             }
-            Set<String> keys = store.drainRecentReads();
+            Set<String> keys = local.drainRecentReads();
             if (keys.isEmpty()) {
                 return;
             }
@@ -1694,9 +1781,9 @@ public class CacheService
                 && options.needsAccessTracking()
                 && !cluster.isLeader() && holdsReplica();
         if (shouldReport) {
-            store.enableReadReporting(options.accessReportSampleRate(), options.accessReportMaxKeys());
+            local.enableReadReporting(options.accessReportSampleRate(), options.accessReportMaxKeys());
         } else {
-            store.disableReadReporting();
+            local.disableReadReporting();
         }
     }
 
@@ -1783,12 +1870,12 @@ public class CacheService
                 // true: the file stores absolute expiry instants. Loading compares them with
                 // the current instant, and however long the file sat on disk makes no difference
                 // -- anything expired is discarded inside restore
-                store.restore(loaded.chunks(), true);
+                local.restore(loaded.chunks(), true);
             }
             log.info("Loaded the cache from disk: file={}, keys when written={}, keys after "
                             + "loading={}, {}s since it was written; keys that expired meanwhile "
                             + "were discarded",
-                    persistence.file(), loaded.keyCount(), store.keyCount(),
+                    persistence.file(), loaded.keyCount(), local.keyCount(),
                     loaded.elapsedMillis() / 1000);
             persistence.delete();
         } catch (RuntimeException e) {
@@ -1841,10 +1928,10 @@ public class CacheService
             // The snapshot is taken inside the state lock, so no write slips in -- otherwise
             // what reaches disk would be half old and half new
             synchronized (stateLock) {
-                keys = store.keyCount();
+                keys = local.keyCount();
                 // true: TTLs are stored as absolute expiry instants; see
                 // CacheStore.dump(int, boolean)
-                chunks = store.dump(4 * 1024 * 1024, true);
+                chunks = local.dump(4 * 1024 * 1024, true);
             }
             long bytes = persistence.dump(chunks, keys);
             log.info("The cache was written to disk: file={}, keys={}, size={} KB, this node is "
@@ -1872,7 +1959,7 @@ public class CacheService
         }
         syncReadReporting();
         log.info("This node became the cache leader: epoch={}, keys={}", epoch,
-                store.keyCount());
+                local.keyCount());
         announceEpoch();
     }
 
@@ -1966,12 +2053,23 @@ public class CacheService
         m.put("epoch", epoch);
         m.put("appliedVersion", appliedVersion());
         m.put("keyCount", store.keyCount());
-        m.put("approxBytes", store.approxBytes());
+        m.put("localKeyCount", local.keyCount());
+        m.put("approxBytes", local.approxBytes());
         m.put("maxKeys", options.maxKeys());
         m.put("maxBytes", options.maxBytes());
         m.put("evictionPolicy", options.evictionPolicy().name());
         m.put("evicted", evicted.get());
         m.put("accessReported", accessReported.get());
+        // Present whether or not an external store is configured, so a dashboard does not have
+        // to guess: without one, spilled stays at 0 and every eviction really is a loss
+        m.put("externalStore", composite != null);
+        m.put("spilled", spilled.get());
+        m.put("spillFailures", spillFailures.get());
+        if (composite != null) {
+            m.put("externalKeyCount", composite.external().keyCount());
+            composite.external().describe()
+                    .forEach((k, v) -> m.put("external." + k, v));
+        }
         m.put("bufferedUpdates", bufferedUpdates());
         m.put("outboxDepth", outbox.size());
         m.put("outboxOverflow", outboxOverflow.get());

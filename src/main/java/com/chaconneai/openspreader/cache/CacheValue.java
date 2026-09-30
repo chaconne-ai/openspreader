@@ -291,6 +291,37 @@ public final class CacheValue {
         return statCount;
     }
 
+    /**
+     * Sets the whole aggregate at once, which sampling cannot do: three samples would leave a
+     * count of three. Only moving a key between stores needs this.
+     *
+     * <p>{@code max} and {@code min} are the <b>internal</b> form here, meaning the infinities
+     * of an empty aggregate rather than the NaN that {@link CacheStats} publishes.
+     */
+    /**
+     * Whether this string has ever been written a bit at a time.
+     *
+     * <p><b>Deliberately outside the serialised form</b>, so the wire format and the snapshot
+     * format are untouched. Losing it on a restore costs nothing that matters: the first
+     * {@code setbit} sets it again, and all it does is keep a bitmap out of the external store.
+     */
+    private transient boolean bitmap;
+
+    boolean isBitmap() {
+        return bitmap;
+    }
+
+    void markBitmap() {
+        this.bitmap = true;
+    }
+
+    void setStats(double max, double min, double sum, long count) {
+        this.statMax = max;
+        this.statMin = min;
+        this.statSum = sum;
+        this.statCount = count;
+    }
+
     void restoreStats(double max, double min, double sum, long count) {
         this.statMax = max;
         this.statMin = min;

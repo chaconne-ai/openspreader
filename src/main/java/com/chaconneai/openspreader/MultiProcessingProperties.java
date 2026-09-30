@@ -771,5 +771,40 @@ public class MultiProcessingProperties {
         /** How many keys one round gathers to report at most, so that a scanning access pattern
          *  does not eat the memory. */
         private int accessReportMaxKeys = 10_000;
+
+        /**
+         * Where keys go when memory runs short. Off by default, and off means the cache
+         * behaves exactly as it always has: eviction deletes.
+         */
+        private External external = new External();
+
+        /**
+         * The external store, for the keys eviction would otherwise drop.
+         *
+         * <p>Turning this on needs a Redis connection in the application already, meaning
+         * {@code spring.data.redis.*} and {@code spring-boot-starter-data-redis} on the
+         * classpath. Registering a {@link com.chaconneai.openspreader.cache.CacheStore} bean
+         * of your own works too, and takes precedence over this.
+         */
+        @Data
+        public static class External {
+
+            /**
+             * Whether to build a Redis-backed store. <b>False by default</b>: an external
+             * store changes where evicted keys end up, and that is not something to switch on
+             * behind an application's back.
+             */
+            private boolean enabled = false;
+
+            /**
+             * What every key is prefixed with over there.
+             *
+             * <p>Redis is nearly always shared with the rest of an application, and the
+             * prefix is what keeps {@code keys}, {@code keyCount} and a clear from reaching
+             * data that is none of this cache's business.
+             */
+            private String keyPrefix = "spreader:cache:";
+        }
+
     }
 }

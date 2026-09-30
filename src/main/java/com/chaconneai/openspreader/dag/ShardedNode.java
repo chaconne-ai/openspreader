@@ -47,53 +47,30 @@ import java.util.concurrent.TimeoutException;
  * }
  * }</pre>
  *
- * <h2>It builds nothing: the sharding is openspreader's</h2>
- * Everything hard about this is already solved by {@link ProcessingMapReduce}, and reaching
- * for it rather than writing a second scatter-gather is the whole point:
+ * <h2>The sharding is {@link ProcessingMapReduce}'s</h2>
+ * Splitting, running a piece per node, gathering the pieces and bounding the whole thing all
+ * come from there. Two of its properties matter here:
  *
- * <table border="1">
- *   <caption>What the aggregation component supplies</caption>
- *   <tr><th>Needed</th><th>Supplied by</th></tr>
- *   <tr><td>Splitting the work into pieces</td>
- *       <td>{@link MapReduceJob#split}, with the node count as a hint</td></tr>
- *   <tr><td>A piece per node, in parallel</td><td>{@code map}, on every node at once</td></tr>
- *   <tr><td>Gathering the pieces back into one</td><td>{@code reduce}, then assembly</td></tr>
- *   <tr><td>A ceiling on the whole thing</td><td>the job timeout</td></tr>
- * </table>
- *
- * <p>Two of those are worth dwelling on, because writing this by hand would get them wrong.
- *
- * <p><b>Pieces are not items.</b> {@code split} decides how many shards, which is why ten
- * thousand records do not become ten thousand dispatches. Fanning out with one call per item
- * would have meant writing that batching again.
+ * <p><b>Pieces are not items.</b> {@code split} decides how many shards, so ten thousand
+ * records do not become ten thousand dispatches.
  *
  * <p><b>An empty input is not a failure.</b> Nothing to shard writes an empty result and the
  * graph carries on. Left to the job, an empty collection would make {@code split} return zero
- * shards, which the aggregation component refuses outright, so "no orders today" would fail
- * the whole run.
+ * shards, which is refused outright, and "no orders today" would fail the whole run.
  *
- * <p><b>A full queue rejects rather than discards.</b> The aggregation component chose that
- * policy deliberately, because losing one intermediate result makes an aggregate <b>silently
- * wrong</b>. A gather wants exactly that: fail loudly rather than return a short answer.
- *
- * <h2>The graph stays static, and that is deliberate</h2>
- * However many shards there turn out to be, this remains <b>one node</b>: one box in the
- * picture, one status in the {@link RunResult}, one entry in the ancestor table. The
- * alternative, letting a node expand into N nodes at run time, would break the two
- * assumptions that make {@link CompiledGraph} cheap and checkable: that the node set is fixed
- * and that reachability can be computed once.
- *
- * <p>The cost is honest: the picture cannot show that this step actually ran forty-seven
- * ways. {@link MapReduceResult#stats()} can.
+ * <h2>However many shards, this stays one node</h2>
+ * One box in the picture, one status in the {@link RunResult}, one entry in the ancestor
+ * table. Letting a node expand into N at run time would break the assumptions that make
+ * {@link CompiledGraph} checkable: a fixed node set and reachability computed once. The cost
+ * is that the picture cannot show this step ran forty-seven ways;
+ * {@link MapReduceResult#stats()} can.
  *
  * <h2>The per-shard work is a job, not a node</h2>
- * What runs per shard is {@code map} on a {@link MapReduceJob} bean, not a {@link GraphNode}.
- * So a shard cannot have conditional edges of its own or its own fan-in.
- *
- * <p>It <b>can</b> be a whole graph, though, and that is the way round this: a
- * {@code CompiledGraph} is built in a bean and exists on every replica, so {@code map} is
- * free to call {@code invoke} on one. Per-shard work with internal dependencies is therefore
- * expressible, it simply lives in the job rather than in the outer graph.
+ * What runs per shard is {@code map} on a {@link MapReduceJob} bean, so a shard has no
+ * conditional edges or fan-in of its own. It <b>can</b> be a whole graph though: a
+ * {@code CompiledGraph} built in a bean exists on every replica, and {@code map} is free to
+ * call {@code invoke} on one. Per-shard work with internal dependencies lives in the job
+ * rather than in the outer graph.
  *
  * <h2>Switch the aggregation component on</h2>
  * {@code spring.spreader.multiprocessing.aggregation.enabled=true}, on every replica, as with

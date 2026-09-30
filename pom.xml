@@ -131,6 +131,14 @@
 			<version>2.0.12</version>
 			<optional>true</optional>
 		</dependency>
+		<!-- The external cache store's Redis implementation. Optional: without it there is
+		     no RedisCacheStore bean and the cache evicts as it always has. -->
+		<dependency>
+			<groupId>org.springframework.data</groupId>
+			<artifactId>spring-data-redis</artifactId>
+			<optional>true</optional>
+		</dependency>
+
 		<!-- The DAG definition format. Optional: only needed to write a graph out or
 		     read one back. Both ship with Spring Boot anyway. -->
 		<dependency>
@@ -224,14 +232,15 @@
 				</executions>
 			</plugin>
 
-			<!-- Javadoc jar for publishing. doclint is off so a missing @param tag
-			     cannot block a release. -->
+			<!-- Javadoc jar for publishing. doclint=reference reports a {@link} whose target
+			     no longer exists, which is how stale comments get caught; it does not check
+			     for missing @param. failOnError=false keeps it to a warning. -->
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-javadoc-plugin</artifactId>
 				<version>3.11.2</version>
 				<configuration>
-					<doclint>none</doclint>
+					<doclint>reference</doclint>
 					<quiet>true</quiet>
 					<encoding>UTF-8</encoding>
 					<charset>UTF-8</charset>
