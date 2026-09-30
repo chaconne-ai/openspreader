@@ -159,7 +159,17 @@ public enum CacheOp {
      * losing either one would skew the average permanently, and nothing in the result would
      * show it -- bound into one, that window does not exist.
      */
-    SUM(24);
+    SUM(24),
+
+    /**
+     * Removes every member whose score falls in a range.
+     *
+     * <p>{@code value} carries the bounds as two doubles, sixteen bytes in all: the lower
+     * first. Unlike {@link #ZPOPMIN}, this one <b>is</b> replicated as it stands, because
+     * "everything between these two scores" names the same members on every node, whereas
+     * "the smallest one" does not once two members share a score.
+     */
+    ZREMRANGEBYSCORE(25);
 
     private final byte code;
 

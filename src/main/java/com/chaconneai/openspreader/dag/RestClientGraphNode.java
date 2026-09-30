@@ -28,20 +28,20 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * {@link HttpGraphNode} on Spring's {@code RestClient}.
+ * {@link HttpGraphNode} on Spring's {@code RestClient}, and the implementation the
+ * auto-configuration registers.
  *
- * <p>Of the three, the one whose shape matches a node's: <b>it is synchronous</b>. A node
- * returns a value, so the call has to be awaited somewhere; here that happens in the client
- * rather than by blocking a reactive chain, as {@link WebClientGraphNode} must.
+ * <p>Its shape matches a node's: <b>it is synchronous</b>. A node returns a value, so the call
+ * has to be awaited somewhere, and here that happens in the client rather than by blocking a
+ * reactive chain.
  *
- * <p>It also lives in {@code spring-web} rather than {@code spring-webflux}, which any Spring
- * Boot web application already has, and it goes through the application's own
- * {@code ClientHttpRequestFactory}: the timeouts, the proxy, the interceptors and the
- * observation registry it has already configured apply here too.
+ * <p>It goes through the application's own {@code ClientHttpRequestFactory}, so the timeouts,
+ * the proxy, the interceptors and the observation registry already configured there apply here
+ * too.
  *
- * <p>Both are optional dependencies of this library, and the default remains the JDK's own
- * client. Choose this one with
- * {@code spring.spreader.multiprocessing.dag.http-client=rest-client}.
+ * <p>{@code spring-web} is an optional dependency of this library. Without it there is no
+ * {@code httpGraphNode} bean, and writing one means extending {@link HttpGraphNode} and
+ * declaring it under that name; see there for the extension point.
  *
  * @author Fred Feng
  * @version 1.0.0

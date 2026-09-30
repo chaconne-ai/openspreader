@@ -41,7 +41,7 @@ public enum NodeStatus {
      *
      * <p>Two ways in: a conditional upstream chose another branch, or every inbound edge
      * was itself skipped. <b>Skipped is not a failure</b>: downstream nodes on
-     * {@link Trigger#ALL_SUCCESS} treat a skipped predecessor as satisfied and carry on.
+     * {@link Trigger#all()} treat a skipped predecessor as satisfied and carry on.
      * Treating it as a failure would make every conditional fail the whole graph; treating
      * it as "keep waiting" would hang it. This third state is what keeps conditionals and
      * fan-ins able to coexist.

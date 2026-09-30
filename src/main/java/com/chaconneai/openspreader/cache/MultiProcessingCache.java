@@ -15,6 +15,7 @@
  */
 package com.chaconneai.openspreader.cache;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -189,6 +190,27 @@ public class MultiProcessingCache implements ProcessingCache {
         new ScoredMember(requireMember(member), score);
         return service.write(CacheOp.ZADD, requireKey(key), "", member,
                 Double.doubleToRawLongBits(score)).flag();
+    }
+
+    @Override
+    public List<ScoredMember> zrangeByScore(String key, double min, double max,
+                                            int offset, int count) {
+        return service.store().zrangeByScore(requireKey(key), min, max, false, offset, count);
+    }
+
+    @Override
+    public List<ScoredMember> zrevrangeByScore(String key, double min, double max,
+                                               int offset, int count) {
+        return service.store().zrangeByScore(requireKey(key), min, max, true, offset, count);
+    }
+
+    @Override
+    public int zremrangeByScore(String key, double min, double max) {
+        // The bounds travel as sixteen bytes, the lower first: two doubles will not pack into
+        // the single long the message format carries
+        byte[] bounds = ByteBuffer.allocate(16).putDouble(min).putDouble(max).array();
+        return (int) service.write(CacheOp.ZREMRANGEBYSCORE, requireKey(key), "", bounds, 0L)
+                .number();
     }
 
     @Override

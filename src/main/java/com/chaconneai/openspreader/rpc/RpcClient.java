@@ -46,44 +46,30 @@ import java.util.concurrent.TimeUnit;
  * }
  * }</pre>
  *
- * <h2>Its division of labour with {@code @MultiProcessingCall}</h2>
- * <table border="1">
- *   <caption>Which to use when</caption>
- *   <tr><th></th><th>{@code @MultiProcessingCall}</th><th>{@code @RpcClient}</th></tr>
- *   <tr><td>Who is called</td><td>Another replica of <b>the same application</b></td>
- *       <td>An instance of <b>another application</b></td></tr>
- *   <tr><td>Why</td><td>To spread the computation; anyone can do it</td>
- *       <td>Only the other side has that capability</td></tr>
- *   <tr><td>Alone in the cluster</td><td>Runs locally, without the network</td>
- *       <td>Fails -- the other side is simply not in the cluster</td></tr>
- *   <tr><td>How it is written</td><td>An annotation on the method; the caller notices
- *       nothing</td><td>Define an interface and inject it</td></tr>
- * </table>
+ * <h2>Against {@code @MultiProcessingCall}</h2>
+ * That one calls another replica of <b>the same</b> application to spread computation, and
+ * falls back to running locally when alone. This one calls <b>another</b> application because
+ * only it has that capability, and fails when that application is not in the cluster.
  *
- * <p>The two share <b>one allow-list</b>: the serving method must carry
- * {@link MultiProcessingCall}, or the request is refused. That is not for convenience but
- * because they guard against the same thing -- without an allow-list, any node in the cluster
+ * <p>They share <b>one allow-list</b>: the serving method must carry
+ * {@link MultiProcessingCall} or the request is refused. Without it, any node in the cluster
  * could reflectively call any method of any bean in this process.
  *
  * <h2>It is synchronous</h2>
- * A call blocks until the result arrives or it times out, exactly as a local call does. For
- * asynchrony, wrap it in {@code CompletableFuture.supplyAsync} -- no asynchronous form is
- * offered here, because "it looks like a local call" is the whole point, and a second form is
- * a second thing to hold in mind.
+ * A call blocks until the result arrives or times out, exactly as a local call does. For
+ * asynchrony wrap it in {@code CompletableFuture.supplyAsync}; no asynchronous form is offered
+ * because "it looks like a local call" is the whole point.
  *
  * <h2>The target is chosen afresh on every call</h2>
- * Each call reads the member list again and picks an instance by the cluster's configured
- * load-balancing strategy ({@code spring.spreader.load-balancer}, round-robin by default). So
- * the next call follows the other side's scaling <b>immediately</b>, and nowhere caches "how
- * many instances they have".
+ * Each call reads the member list again and picks an instance by
+ * {@code spring.spreader.load-balancer} (round-robin by default), so scaling on the other side
+ * takes effect immediately and nothing caches how many instances they have.
  *
  * <h2>Retries and idempotence</h2>
- * A failure is retried {@link #maxRetries()} times, <b>on a different instance each time</b>.
- *
- * <p><b>The called method should therefore be idempotent.</b> Retrying after a timeout brings
- * an unavoidable problem: the request may already have completed, with only the reply lost on
- * the way back. A non-idempotent operation -- a debit, an order -- must either carry an
- * idempotence key of its own or set {@code maxRetries} to 0.
+ * A failure is retried {@link #maxRetries()} times, <b>on a different instance each time</b>,
+ * so <b>the called method should be idempotent</b>. Retrying after a timeout is unavoidably
+ * ambiguous: the request may have completed with only the reply lost. A debit or an order must
+ * carry an idempotence key of its own, or set {@code maxRetries} to 0.
  *
  * @author Fred Feng
  * @version 1.0.0

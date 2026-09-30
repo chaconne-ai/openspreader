@@ -48,37 +48,23 @@ import java.util.List;
  * }
  * }</pre>
  *
- * <h2>Where each of the three phases runs</h2>
- * <table border="1">
- *   <caption>Where execution happens</caption>
- *   <tr><th>Method</th><th>Which node runs it</th><th>How many times</th></tr>
- *   <tr><td>{@link #split}</td><td><b>The submitter only</b></td><td>Once</td></tr>
- *   <tr><td>{@link #map}</td><td>Every node, <b>the submitter among them</b></td>
- *       <td>Once per shard</td></tr>
- *   <tr><td>{@link #reduce}</td><td>Decided by the key's hash</td>
- *       <td>Once per distinct key</td></tr>
- * </table>
+ * <h2>Where each phase runs</h2>
+ * {@link #split} runs on the submitter alone, once. {@link #map} runs on every node, the
+ * submitter included, once per shard. {@link #reduce} runs wherever the key's hash sends it,
+ * once per distinct key. Combining the nodes' partial results is not yours to write: one key
+ * is reduced on exactly one node, so combining is just joining maps.
  *
- * <p>The last step, combining the nodes' partial results into one, <b>is not yours to
- * write</b> -- one key is reduced on exactly one node, so combining is joining a few maps
- * together, with no value left to compute.
+ * <h2>Every node needs this bean, at the same version</h2>
+ * Half the nodes on a new {@code map} and half on the old one produce <b>a wrong answer rather
+ * than an error</b>, which is the hardest kind to find. Do not submit jobs during a rolling
+ * deployment.
  *
- * <h2>Every node in the cluster needs this bean, at the same version</h2>
- * The same constraint as {@code ProcessingPool}'s. Half the nodes on a new {@code map} and
- * half on the old one produce <b>a wrong answer rather than an error</b> -- the hardest kind
- * to track down. Do not submit jobs during a rolling deployment.
- *
- * <h2>{@code @MultiProcessingCall} is not needed</h2>
- * {@code map} and {@code reduce} really are called remotely by other nodes, but the allow-list
- * here <b>comes from the type itself</b>: only an object implementing this interface and
- * registered as a bean receives tasks, and <b>only the interface's two methods</b> can be
- * called -- no reflection, no lookup by method name, and no path anywhere in the cluster that
- * reaches another method through it.
- *
- * <p>Adding the annotation is in fact <b>harmful</b>: it would register these two methods in
- * {@code ProcessingPool}'s allow-list, opening an extra
- * {@code pool.submit(beanName, "map", ...)} call path -- and {@link Emitter} is not
- * serialisable at all, so that path could only blow up at runtime.
+ * <h2>Do not add {@code @MultiProcessingCall}</h2>
+ * It is unnecessary and harmful. Unnecessary because the allow-list here is the type itself:
+ * only a bean implementing this interface receives tasks, and only these methods are reachable.
+ * Harmful because it would also register them in {@code ProcessingPool}, opening a
+ * {@code pool.submit(bean, "map", ...)} path that can only fail at runtime, since
+ * {@link Emitter} is not serialisable.
  *
  * @param <IN> the input type, which is also the shard type. Must be serialisable
  * @param <K>  the intermediate key, which is also the final result's key. Must be serialisable

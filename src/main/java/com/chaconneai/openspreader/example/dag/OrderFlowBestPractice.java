@@ -127,11 +127,9 @@ public class OrderFlowBestPractice {
     }
 
     /**
-     * The graph as text, in whatever format is configured.
-     *
-     * <p>One output rather than a method per format; see
-     * {@code spring.spreader.multiprocessing.dag.renderer}. Mermaid for a README, JSON for a
-     * front end, and {@code render(GraphRenderer)} for anything else.
+     * The graph as text. {@code render()} writes JSON, which is what a front end or an audit
+     * record wants; {@code toMermaid()} draws it for a README, and
+     * {@code render(GraphRenderer)} takes any other format.
      */
     public String diagram() {
         return flow.render();

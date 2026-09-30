@@ -19,8 +19,10 @@ import com.chaconneai.openspreader.cache.CacheOptions;
 import com.chaconneai.openspreader.cache.CachePersistence;
 import com.chaconneai.openspreader.event.MultiProcessingEventBridge;
 import com.chaconneai.openspreader.cache.CacheService;
+import com.chaconneai.openspreader.cache.CacheStore;
 import java.nio.file.Path;
 import com.chaconneai.openspreader.cache.ProcessingCache;
+import com.chaconneai.openspreader.cache.RedisCacheStore;
 import com.chaconneai.openspreader.cache.MultiProcessingCache;
 import com.chaconneai.openspreader.dag.MultiProcessingDag;
 import com.chaconneai.openspreader.dag.GraphNode;
@@ -65,6 +67,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import com.chaconneai.openspreader.concurrent.ExecutorServiceHolder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.scheduling.TaskScheduler;
@@ -525,12 +528,40 @@ public class MultiProcessingAutoConfiguration {
      * <p>Its channel is its own, separate from locks and semaphores and affecting neither;
      * switching any one of them off leaves the others working as usual.
      */
+    /**
+     * The Redis-backed external store, built only when asked for.
+     *
+     * <p>Three things all have to be true: {@code spring-data-redis} on the classpath, a
+     * {@code RedisConnectionFactory} the application already has, and
+     * {@code ...cache.external.enabled=true}. Miss any one and no bean appears, which leaves
+     * the cache evicting into thin air exactly as it did before.
+     *
+     * <p>{@link ConditionalOnMissingBean} means an application's own {@link CacheStore} wins:
+     * a file, a table, or anything else it would rather keep keys in.
+     */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(name = "org.springframework.data.redis.connection.RedisConnectionFactory")
+    @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.cache.external",
+            name = "enabled", havingValue = "true", matchIfMissing = false)
+    public static class RedisCacheStoreConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean(CacheStore.class)
+        @ConditionalOnBean(RedisConnectionFactory.class)
+        public CacheStore externalCacheStore(RedisConnectionFactory factory,
+                                             MultiProcessingProperties props) {
+            String prefix = props.getCache().getExternal().getKeyPrefix();
+            log.info("Cache overflow will use Redis under the prefix \"{}\"", prefix);
+            return new RedisCacheStore(factory, prefix);
+        }
+    }
+
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     @ConditionalOnProperty(prefix = "spring.spreader.multiprocessing.cache", name = "enabled",
             havingValue = "true", matchIfMissing = false)
     public CacheService cacheService(GossipCluster cluster, MultiProcessingProperties props,
-            ExecutorServiceHolder executors) {
+            ExecutorServiceHolder executors, ObjectProvider<CacheStore> externalStore) {
         MultiProcessingProperties.Cache c = props.getCache();
         CacheOptions options = new CacheOptions(
                 c.getApplicationName(), c.getRequestTimeoutMs(), c.getRetryIntervalMs(),
@@ -555,7 +586,15 @@ public class MultiProcessingAutoConfiguration {
                     + "startup, written once at shutdown, and never written while running", file);
         }
 
-        CacheService service = new CacheService(cluster, options, executors, persistence);
+        // Any CacheStore bean becomes the place keys go when memory runs short. None, and the
+        // cache behaves exactly as before: eviction deletes, and the store is the local one
+        CacheStore external = externalStore.getIfAvailable();
+        if (external != null) {
+            log.info("Cache overflow enabled: keys evicted from memory are written to {} "
+                    + "instead of being dropped", external.getClass().getSimpleName());
+        }
+
+        CacheService service = new CacheService(cluster, options, executors, persistence, external);
         service.start();
         return service;
     }

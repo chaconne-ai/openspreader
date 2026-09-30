@@ -259,7 +259,7 @@ the lock for a minimum span prevents that.
 
 ### The cache
 
-47 commands over four data structures (strings, hashes, lists, sorted sets),
+50 commands over four data structures (strings, hashes, lists, sorted sets),
 plus bitmaps and Bloom filters on top.
 
 ```java
@@ -267,6 +267,11 @@ cache.set("k", bytes, 10, TimeUnit.MINUTES);
 cache.hset("user:1", "email", bytes);
 cache.zadd("leaderboard", member, 99.5);
 cache.setbit("seen", offset, true);
+
+// A page of a score range, so a wide query cannot hand back a million members
+cache.zrangeByScore("series", from, to, 0, 500);
+// A retention policy in one operation, rather than one zrem per member
+cache.zremrangeByScore("series", 0, cutoff);
 
 ProcessingBloomFilter filter = ProcessingBloomFilter.create(cache, "sms:sent", 1_000_000L, 0.01);
 filter.put(phone);
@@ -315,7 +320,7 @@ different instances, and a single instance is still a valid deployment.
 | | |
 |---|---|
 | **It builds nothing of its own** | Dispatch is the process pool, dynamic fan-out is `ProcessingMapReduce`, the reply cache that makes a retried dispatch safe is the pool's. The engine is the weaving |
-| **The graph is checked at `compile()`** | Cycles, unreachable nodes, an unreachable quorum, and two parallel branches writing one channel with no reducer declared, which is the one that would otherwise lose a write in silence |
+| **The graph is checked at `compile()`** | Cycles, unreachable nodes, an unreachable quorum, an edge to a node that does not exist. Two parallel branches writing one channel with no reducer cannot be seen before the run, since nothing declares which node writes what; that one fails the run at the second write rather than losing it in silence |
 | **A skipped branch does not hang a join** | An unchosen branch is marked skipped and that propagates, so a fan-in downstream completes instead of waiting for something that will never arrive |
 | **Parallel merges are ordered by node name** | Not by arrival, so the same graph gives the same answer on a different day |
 | **A step can be a whole graph** | `SubGraph` is a node that is itself a graph, which is how a workflow stays readable past a dozen steps |
@@ -618,6 +623,76 @@ Eviction samples 5 keys and evicts the least recently used among them (Redis
 does the same). Exact LRU would require a global lock on every read, which would
 cost the 1.3M reads/s that make the cache worth having. Raise `eviction-samples`
 to 10 for a closer approximation.
+
+### When memory is not enough: an external store
+
+Eviction loses data. That is what a cache does, and for a cache it is usually
+right. Where it is not, give the cache somewhere to put the keys it has to let
+go of, and eviction becomes a **move** rather than a loss: memory stays inside
+its limits and the data is still readable.
+
+Two ways to give it one. The Redis implementation that ships:
+
+```properties
+spring.spreader.multiprocessing.cache.external.enabled=true
+spring.spreader.multiprocessing.cache.external.key-prefix=spreader:cache:
+```
+
+That needs `spring-data-redis` on the classpath and a `RedisConnectionFactory`
+the application already has, meaning the ordinary `spring.data.redis.*` settings.
+Miss any one of the three and no bean appears.
+
+Or your own, for a file, a table, or anything else:
+
+```java
+@Bean
+CacheStore externalCacheStore(DataSource dataSource) {
+    return new MyTableCacheStore(dataSource);
+}
+```
+
+A bean of your own wins over the built-in one, so the property above can stay off.
+
+**Nothing is enabled by default.** With no such bean the cache holds its
+`LocalCacheStore` directly, eviction deletes as it always has, and not a single
+call goes through the composing layer.
+
+What changes when one is present:
+
+| | |
+|---|---|
+| **A key lives in exactly one half** | Memory, or outside. No merging, no question of which copy is current. Reads ask memory first, then outside; writes go where the key already is |
+| **Eviction moves instead of deleting** | The same sampling and the same policy pick the key, but it is written across before the memory copy goes. The DEL still reaches every node, so all of them drop it together and the replicas stay identical |
+| **Only the leader writes outside** | It is the leader that makes eviction decisions, and a follower replaying the replication stream touches memory only. So an external store is written by one node, whatever it is |
+| **Snapshots cover memory only** | A node joining pulls the memory half. Keys that were moved out are not copied to it, which is the point: they exist once |
+| **Bitmaps stay in memory** | A bit test is one memory read here and a round trip out there, and a Bloom filter lookup does seven. So a bitmap is neither moved nor deleted, and `spring.spreader.multiprocessing.cache.max-bytes` has to be big enough to hold the ones you use |
+| **Aggregates move whole** | `max`/`min`/`sum` keep four numbers, and feeding them back as three samples would put the count at 1. They cross intact instead |
+
+One consequence worth stating: **whether a follower can read what the leader
+moved out depends on the store you choose.** A shared one (Redis, a database)
+means every node reads it; a per-node one (a local file) means only the leader
+does, and the others see a miss. That is a property of the backend, not of this
+library, and it is your choice to make.
+
+What to watch:
+
+```
+spreader_cache_spilled        keys moved out rather than dropped
+spreader_cache_evicted        keys eviction dealt with in total
+spreader_cache_keys_local     what is in this process's memory
+spreader_cache_keys_external  what is outside
+spreader_cache_spill_failures keys dropped because the store would not take them
+```
+
+`spilled` against `evicted` says how much of the eviction was a loss. With no
+external store the two never meet, because `spilled` stays at 0.
+
+**Alert on `spill_failures`.** An unreachable store does not fail the write that
+triggered the eviction: that would turn "Redis is down" into "the cache rejects
+writes", which is worse than the loss it was configured to prevent. The key is
+dropped as it would have been without a store, a warning is logged, and this
+counter moves. Non-zero means the safety net is gone and the cache is losing data
+again.
 
 ### Timeouts
 

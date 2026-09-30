@@ -16,14 +16,10 @@
 package com.chaconneai.openspreader.dag;
 
 /**
- * Which renderer {@code CompiledGraph.render()} uses.
+ * The serialisation formats that ship, for {@code CompiledGraph.render(GraphRenderer)}.
  *
- * <p>One output, chosen by configuration, rather than a method per format. Both describe the
- * same graph, so offering a method each would invite an application to emit both and then
- * have to keep them in step somewhere downstream.
- *
- * <p>Set with {@code spring.spreader.multiprocessing.dag.renderer}. A format of your own is
- * still reachable: {@code CompiledGraph.render(GraphRenderer)} takes any implementation.
+ * <p>{@code CompiledGraph.render()} with no argument writes JSON. A format of your own is one
+ * {@link GraphRenderer} implementation away, passed to {@code render(GraphRenderer)}.
  *
  * <p><b>Mermaid and DOT are not here</b>, because neither is a serialisation: they draw a
  * picture and cannot be read back. {@link PrintUtils} holds them, and

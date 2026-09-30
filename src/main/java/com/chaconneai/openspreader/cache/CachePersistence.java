@@ -45,7 +45,7 @@ import java.util.zip.GZIPOutputStream;
  * lost". Anything that genuinely needs the latter should not live in a cache alone.
  *
  * <h2>The format is the full-synchronisation format, reused</h2>
- * {@link CacheStore#dump(int)} and {@link CacheStore#restore(List)} already serialise the four
+ * {@link LocalCacheStore#dump(int)} and {@link LocalCacheStore#restore(List)} already serialise the four
  * data structures plus the statistics into bytes, for synchronising between nodes. A disk
  * format of its own would only bring a second copy of the encoding, and the two would drift
  * apart sooner or later -- a divergence whose symptom is "it stores and reads back, but what
@@ -57,9 +57,9 @@ import java.util.zip.GZIPOutputStream;
  * would have a peer whose clock is a few seconds slow treat unexpired keys as expired.
  *
  * <p>Going to disk need not accommodate clock skew, so the <b>absolute expiry instant</b> is
- * stored -- the second parameter of {@link CacheStore#dump(int, boolean)}. However long the
+ * stored -- the second parameter of {@link LocalCacheStore#dump(int, boolean)}. However long the
  * file sits on disk makes no difference: loading compares it with the instant of loading, and
- * {@link CacheStore#restore(List, boolean)} discards whatever has expired.
+ * {@link LocalCacheStore#restore(List, boolean)} discards whatever has expired.
  *
  * <p>Storing the milliseconds remaining is what would be awkward: "five minutes left",
  * restored as it was, becomes "five minutes from now", <b>reviving expired keys wholesale</b>,
@@ -108,7 +108,7 @@ public class CachePersistence {
      * <p>A rename within one filesystem is atomic: either the old file is seen or the new one
      * is, and there is no intermediate state where the new file is half written.
      *
-     * @param chunks   what {@link CacheStore#dump(int)} produced
+     * @param chunks   what {@link LocalCacheStore#dump(int)} produced
      * @param keyCount the key count, written into the header purely so loading can log it
      * @return how many bytes were written
      */
@@ -213,7 +213,7 @@ public class CachePersistence {
     /**
      * The result of one load.
      *
-     * @param chunks   the snapshot chunks, ready to hand to {@link CacheStore#restore(List)}
+     * @param chunks   the snapshot chunks, ready to hand to {@link LocalCacheStore#restore(List)}
      * @param dumpedAt the dump instant, for logging only -- TTLs are absolute and need no
      *                 conversion
      * @param keyCount the key count at dump time, for logging only

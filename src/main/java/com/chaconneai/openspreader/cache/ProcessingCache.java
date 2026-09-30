@@ -334,6 +334,32 @@ public interface ProcessingCache {
     List<ScoredMember> zrevrangeByScore(String key, double min, double max);
 
     /**
+     * A page of a score range, at most {@code count} members starting at {@code offset}.
+     * Matches {@code ZRANGEBYSCORE ... LIMIT}.
+     *
+     * <p>Reach for this whenever the range could be wide. A series of timestamps or a busy
+     * leaderboard can hold millions between two scores, and asking for all of them hands the
+     * caller every one.
+     *
+     * @param count how many at most; negative means no limit
+     */
+    List<ScoredMember> zrangeByScore(String key, double min, double max, int offset, int count);
+
+    /** As above, ordered by score descending. */
+    List<ScoredMember> zrevrangeByScore(String key, double min, double max, int offset,
+                                        int count);
+
+    /**
+     * Removes every member scoring between the two bounds, and answers how many went.
+     * Matches {@code ZREMRANGEBYSCORE}.
+     *
+     * <p>This is what a retention policy wants: "drop everything older than last Tuesday" is
+     * one operation, where removing the members one at a time would be one operation, one
+     * version and one broadcast <b>per member</b>.
+     */
+    int zremrangeByScore(String key, double min, double max);
+
+    /**
      * A member's rank, from 0, matching {@code ZRANK}. This too is O(n).
      *
      * @return the rank, or -1 when the key or the member is absent
