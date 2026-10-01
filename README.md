@@ -5,7 +5,7 @@
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.1-green.svg)](https://spring.io/projects/spring-boot)
 [![Maven Central](https://img.shields.io/badge/maven--central-1.0.0--SNAPSHOT-blue.svg)](https://central.sonatype.com/)
 
-### `java.util.concurrent`, scoped to the cluster. No Redis, no ZooKeeper.
+### The missing piece of Java concurrency: `java.util.concurrent`, scoped to the cluster.
 
 **Thirteen coordination primitives as one Spring Boot starter. The APIs you already know,
 spanning every instance of your application instead of one JVM. Zero lines of configuration to
