@@ -264,8 +264,8 @@ back incrementally.
 **Output**
 
 ```
-reads     over 4,000,000 per second, never touching the network
-writes    roughly 2,000 per second (TCP), 8,300 (UDP)
+reads     2,900,000 to 5,700,000 per second, never touching the network
+writes    about 22,500 per second, cluster-wide, whatever the operation
 ```
 
 So it suits shared state that is **read far more than written**: configuration, allow-lists,
@@ -411,57 +411,44 @@ call, so scaling on the other side takes effect immediately.
 
 ## Performance
 
-**Conditions**: single machine over loopback, 3-node cluster in one JVM, 4-core container, JDK
-serialization. Absolute values do not transfer; the ratios do.
+**Conditions**: 3-node cluster in one JVM over loopback, 4-core container, TCP/NIO with JDK
+serialization, 8 concurrent threads. Measured 2026-10-03 by `CacheWriteStressTest`. Absolute
+values do not transfer; the ratios do. Earlier revisions reported writes several times lower,
+measured single-threaded, which gives one write's latency rather than throughput.
 
 ### Reads never leave the process
 
 | Operation | QPS |
 |---|---:|
-| `exists` | 6,562,196 |
-| `size` | 4,566,915 |
-| `stats` (aggregate, four numbers) | 4,130,498 |
-| `hget` (single field) | 2,104,340 |
-| `getbit` | 1,548,987 |
-| `zscore` | 1,210,631 |
-| `lrange` (50 elements) | 345,364 |
-| `zrange` (50 members) | 287,519 |
-| `hgetAll` (all fields) | 68,489 |
+| `getbit` | 5,700,036 |
+| `stats` (aggregate, four numbers) | 5,125,359 |
+| `exists` / `ttl` / `type` / `size` | 3.3M to 3.7M |
+| `get` | 2,928,187 |
+| `hget` (one field of 500) | 2,454,941 |
+| `zrange` (50 of 500) | 544,151 |
+| `hgetAll` (all 500 fields) | 96,197 |
+| `keys` (wildcard) | 21,836 |
 
-`hget` against `hgetAll` is **30x**. Calling `hgetAll` in a loop is the easiest accidental
-mistake in this API, and it costs more than the read/write gap does.
+`hget` against `hgetAll` is **25x**, and the easiest accidental mistake in this API.
 
-### Writes go through the leader
+### Writes cost one round trip, whatever the operation
 
-| Operation | QPS |
-|---|---:|
-| `max` (aggregate) | 7,314 |
-| `incr` | 6,524 |
-| `min` / `sum` (aggregate) | 6,356 to 6,539 |
-| `zadd` | 5,504 |
-| `rpush` | 4,500 |
-| `hset` | 4,080 |
-| `setbit` (fixed capacity) | 3,419 |
-| `setbit` (growing) | 1,991 |
-
-**Aggregates are the fastest writes.** `max`/`min`/`sum` keep four numbers, so there is no
-allocation, no resizing and no hash lookup, and the value travels in the `arg` field rather
-than as a payload. That is what makes them suitable for downsampling a time series.
-
-### The ceiling, and where it comes from
-
-Writes are serialised globally: every write goes through the leader and takes one state lock,
-because a monotonic version number is what lets all replicas replay in the same order. The
-lock's granularity **is** the version number's granularity.
+All fourteen write operations, each measured in its own fresh cluster, land between 17,600 and
+24,100 per second. The leader executing the same operations on itself reaches 1.3M to 2.5M, so
+what a write costs is the hop, not the work. Controls ruled out the inbound thread pool (4
+threads against 16 moves the peak by 11 percent), the operation type, and the read-your-write
+wait.
 
 | | |
 |---|---|
 | Read scaling | Linear with node count. Reads are local |
-| Write scaling | **Flat.** Adding nodes does not raise write throughput; it raises the leader's broadcast fan-out |
-| Practical write ceiling | ~2,000/s on TCP, ~8,300/s on UDP |
+| Write scaling | **Flat.** One, two and three instances writing at once give 13,966, 12,544 and 19,729 combined |
+| Cluster-wide write ceiling | **~22,500/s**, reached at four concurrent writers |
 
-So the question to ask is how far your write rate is from those numbers. Far means no problem.
-Close means that data may not belong here.
+Past the ceiling the leader discards replication messages rather than slowing down, and
+followers catch up by full snapshot, so `outboxOverflow` in `stats()` is the metric to alert on.
+The question to ask is how far your write rate is from 22,500. Far means no problem. Close means
+that data may not belong here.
 
 ## How This Is Verified
 
@@ -488,6 +475,7 @@ leader**, and the write path for locks, permits, latches, barriers and the cache
 | **Eviction is local** | Nodes can disagree about which keys are resident |
 | **Everything is in-process** | No persistence by default: a full cluster restart starts from empty |
 | **Resume is at-least-once** | A DAG node that ran and reported back, whose record was not yet written when the coordinator died, is a step that happened and is not in the record. An effect outside the process cannot be made atomic with a row inside it |
+| **Writes have a cluster-wide ceiling** | About 22,500 per second in the measured setup, and it does not grow with instance count. This is a design limit, not a defect: writes funnel through the leader because a monotonic version is what lets every replica replay in the same order |
 | **Cross-machine performance is unmeasured** | Every number above is one JVM over loopback |
 
 ## Documentation
