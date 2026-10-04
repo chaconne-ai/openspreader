@@ -17,6 +17,7 @@ package com.chaconneai.openspreader.metrics;
 
 import com.chaconneai.spreader.metrics.BufferMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
 import com.chaconneai.spreader.metrics.LatencySnapshot;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -141,7 +142,7 @@ public class SpreaderMeterBinder implements MeterBinder {
     private void bindChannel(MeterRegistry registry, String channel) {
         // The empty string, meaning the default channel, is awkward to query in Prometheus;
         // give it an explicit name
-        Tags tags = Tags.of("channel", channel.isEmpty() ? "default" : channel);
+        Tags tags = Tags.of("channel", MetricsRegistry.displayName(channel));
 
         gauge(registry, "sent", tags, "messages sent successfully", ChannelMetrics::sent, channel);
         gauge(registry, "send.failures", tags, "failed sends",
@@ -170,11 +171,66 @@ public class SpreaderMeterBinder implements MeterBinder {
         gauge(registry, "retry.rate", tags, "retry rate, 0 to 1",
                 ChannelMetrics::retryRate, channel);
 
+        // The three stages by their plain names. Everything above keeps the name it has
+        // always had -- spreader_channel_concurrency still means the OUTBOUND in-flight
+        // count, because dashboards read it -- and the stage-named series are additions.
+        gauge(registry, "send.rate", tags, "messages sent per second",
+                ChannelMetrics::sendRate, channel);
+        gauge(registry, "arrival.rate", tags,
+                "messages arriving per second: taken in, not yet dealt with",
+                ChannelMetrics::arrivalRate, channel);
+        gauge(registry, "completion.rate", tags,
+                "messages finished per second, successes and failures alike",
+                ChannelMetrics::completionRate, channel);
+        gauge(registry, "handled", tags, "messages a listener has finished",
+                m -> m.handled(), channel);
+        gauge(registry, "handle.failures", tags, "handlings that threw",
+                m -> m.handledFailures(), channel);
+        gauge(registry, "handle.error.rate", tags,
+                "share of finished work that failed, 0 to 1",
+                ChannelMetrics::handleErrorRate, channel);
+        gauge(registry, "inflight", tags,
+                "outbound requests awaiting an answer. The same number as "
+                        + "spreader_channel_concurrency, under a name that says which stage",
+                ChannelMetrics::inflight, channel);
+        gauge(registry, "handling", tags,
+                "work a listener has in hand right now. NOT the same as concurrency, "
+                        + "which is the outbound side",
+                ChannelMetrics::handling, channel);
+        gauge(registry, "handling.peak", tags, "peak work in hand",
+                ChannelMetrics::peakHandling, channel);
+        gauge(registry, "arriving", tags, "arrived and not yet accepted",
+                ChannelMetrics::arriving, channel);
+
         // Latencies are in seconds throughout, which is the Prometheus convention -- it is
         // what makes Grafana recognise them as durations
         latency(registry, "outbound", tags,
                 "outbound latency, from sending to the acknowledgement", channel, true);
         latency(registry, "inbound", tags, "inbound handler time", channel, false);
+        handleLatency(registry, tags, channel);
+    }
+
+    /**
+     * The handling stage's latency.
+     *
+     * <p>Written apart from {@link #latency} rather than threaded through it: that method
+     * picks between two histograms with a boolean, and a third stage would turn the boolean
+     * into an enum and every call site with it. The duplication here is six lines.
+     */
+    private void handleLatency(MeterRegistry registry, Tags tags, String channel) {
+        Tags withDir = tags.and("direction", "handling");
+        gauge(registry, "latency.min", withDir, "handling latency, minimum",
+                m -> nanosToSeconds(m.handleLatency().minNanos()), channel);
+        gauge(registry, "latency.avg", withDir, "handling latency, mean",
+                m -> m.handleLatency().avgNanos() / 1_000_000_000d, channel);
+        gauge(registry, "latency.max", withDir, "handling latency, maximum",
+                m -> nanosToSeconds(m.handleLatency().maxNanos()), channel);
+        gauge(registry, "latency.p50", withDir, "handling latency P50",
+                m -> nanosToSeconds(m.handleLatency().p50Nanos()), channel);
+        gauge(registry, "latency.p95", withDir, "handling latency P95",
+                m -> nanosToSeconds(m.handleLatency().p95Nanos()), channel);
+        gauge(registry, "latency.p99", withDir, "handling latency P99",
+                m -> nanosToSeconds(m.handleLatency().p99Nanos()), channel);
     }
 
     private void latency(MeterRegistry registry, String direction, Tags tags,

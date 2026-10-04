@@ -675,20 +675,39 @@ public class BarrierService extends BufferedGossipListener
 
         return switch (msg.type()) {
             case BARRIER_AWAIT -> {
-                long index = entry.arrive(msg.participantId(), sender.id());
-                if (index < 0) {
-                    yield SyncMessage.ok(msg.requestId(), epoch, name, 0L,
-                            entry.generation(), SyncState.BROKEN);
+                // Index and generation come back together, from one turn of the lock.
+                //
+                // Asking for the generation separately afterwards is what caused a party of
+                // three to wait out its whole 20 seconds, about three quarters of the time
+                // under load: the other two could fill the barrier in between, moving the
+                // generation on, and this party would then settle down to wait for a
+                // generation beyond the one its own round had already reached. See
+                // BarrierEntry.Arrival
+                BarrierEntry.Arrival arrival = entry.arrive(msg.participantId(), sender.id());
+                // The leader's own view of the gathering, which until now was invisible.
+                // Everything on the waiting side could be read from the logs, while the one
+                // thing that settles it -- which party landed where, in which generation --
+                // could not be seen at all
+                if (log.isDebugEnabled()) {
+                    log.debug("Barrier {}: party {} from {} arrived as index {} of {} in "
+                                    + "generation {}{}",
+                            name, msg.participantId(), sender.label(), arrival.index(),
+                            parties, arrival.generation(),
+                            arrival.released() ? ", releasing the round" : "");
                 }
-                boolean tripped = index == parties - 1L;
-                if (tripped) {
+                if (arrival.index() < 0) {
+                    yield SyncMessage.ok(msg.requestId(), epoch, name, 0L,
+                            arrival.generation(), SyncState.BROKEN);
+                }
+                if (arrival.released()) {
                     // The set has filled, so every waiter is woken. Sent on another thread --
                     // a request is still being handled here, and sending waits synchronously
                     // for an ACK
                     notifyWaiters(name);
                 }
-                yield SyncMessage.ok(msg.requestId(), epoch, name, index, entry.generation(),
-                        tripped ? SyncState.SATISFIED : SyncState.PENDING);
+                yield SyncMessage.ok(msg.requestId(), epoch, name, arrival.index(),
+                        arrival.generation(),
+                        arrival.released() ? SyncState.SATISFIED : SyncState.PENDING);
             }
             case BARRIER_LEAVE -> {
                 entry.breakBarrier("party " + msg.participantId()
@@ -703,9 +722,18 @@ public class BarrierService extends BufferedGossipListener
                 yield SyncMessage.ok(msg.requestId(), epoch, name, 0L,
                         entry.generation(), SyncState.PENDING);
             }
-            case BARRIER_QUERY -> SyncMessage.ok(msg.requestId(), epoch, name,
-                    entry.arrivedCount(), entry.generation(),
-                    entry.isBroken() ? SyncState.BROKEN : SyncState.PENDING);
+            case BARRIER_QUERY -> {
+                // A query is how a waiter whose push was lost finds out, so what it was told
+                // is worth seeing: a waiter carrying generation G returns as soon as the
+                // answer carries anything higher
+                if (log.isDebugEnabled()) {
+                    log.debug("Barrier {}: query from party {} answered with {}",
+                            name, msg.participantId(), entry);
+                }
+                yield SyncMessage.ok(msg.requestId(), epoch, name,
+                        entry.arrivedCount(), entry.generation(),
+                        entry.isBroken() ? SyncState.BROKEN : SyncState.PENDING);
+            }
             default -> SyncMessage.fail(msg.requestId(), epoch, name,
                     "not a legitimate request type: " + msg.type());
         };
