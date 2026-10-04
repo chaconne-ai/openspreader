@@ -27,11 +27,14 @@ import com.chaconneai.openspreader.scheduling.MultiProcessingTaskStats;
 import com.chaconneai.openspreader.sync.MutexService;
 import com.chaconneai.spreader.metrics.BufferMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
+import com.chaconneai.spreader.metrics.NodeMetrics;
 import com.chaconneai.spreader.metrics.SplitBrainStatus;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
 import org.springframework.boot.actuate.endpoint.annotation.ReadOperation;
 
 import java.util.List;
+import java.util.function.Function;
 import java.util.Map;
 
 /**
@@ -225,26 +228,43 @@ public class SpreaderReportEndpoint {
 
         // ---------- Transport ----------
         title(sb, "Transport");
-        kv(sb, "Total TPS", round(n.totalTps()));
-        kv(sb, "Error rate", pct(n.errorRate()));
+
         // Business and framework channels are counted separately: framework channels, prefixed
         // spreader., are what the cache, the locks and RPC use for themselves, and their volume
         // is a different thing from business volume
-        kv(sb, "Channels", n.channels().size()
-                + " (business " + n.businessChannels().size()
-                + " / framework " + n.systemChannels().size() + ")");
-        for (Map.Entry<String, ChannelMetrics> e : n.channels().entrySet()) {
-            ChannelMetrics m = e.getValue();
-            String name = e.getKey().isEmpty() ? "default" : e.getKey();
-            // Peak sends and receives are listed apart: with only a total, "the outbound side
-            // is saturated" and "the inbound side is saturated" are the same number, and the
-            // two overloads are investigated in entirely different places
-            sb.append(String.format("  %-22s sent %-8d recv %-8d failed %-6d "
-                            + "peak TPS %.0f/%.0f  P99 %.2fms%n",
-                    name, m.sent(), m.received(), m.sendFailures(),
-                    m.peakSentTps(), m.peakReceivedTps(),
-                    m.outboundLatency().p99Nanos() / 1_000_000.0));
-        }
+        Map<String, ChannelMetrics> byChannel = metrics.channels();
+        kv(sb, "Channels", byChannel.size()
+                + " (business " + metrics.businessChannels().size()
+                + " / framework " + metrics.systemChannels().size() + ")");
+        kv(sb, "Total TPS", round(n.totalTps()));
+        kv(sb, "Error rate", pct(n.errorRate()));
+
+        // One table per stage rather than one wide row.
+        //
+        // A single line carrying all three stages runs past 150 characters and wraps in any
+        // normal terminal, and a wrapped table is worse than no table. Split by stage, each
+        // table's columns line up with the same stage's keys in the JSON endpoint, so a
+        // reader moving between the two does not have to translate anything.
+        channelTable(sb, byChannel, "Channels / outbound (send to acknowledgement)",
+                "send/s     sent  failed  retry   err%   avg_ms   p99_ms  inflight",
+                (m) -> String.format("%6.0f %8d %7d %6d %6s %8.3f %8.3f %9d",
+                        m.sendRate(), m.sent(), m.sendFailures(), m.retries(),
+                        pct(m.sendErrorRate()), m.outboundLatency().avgMillis(),
+                        m.outboundLatency().p99Millis(), m.inflight()));
+
+        channelTable(sb, byChannel, "Channels / arrival (taken in, not yet dealt with)",
+                "arrival/s     recv  failed    dups   avg_ms   p99_ms  arriving",
+                (m) -> String.format("%9.0f %8d %7d %7d %8.3f %8.3f %9d",
+                        m.arrivalRate(), m.received(), m.receiveFailures(), m.duplicates(),
+                        m.inboundProcessing().avgMillis(), m.inboundProcessing().p99Millis(),
+                        m.arriving()));
+
+        channelTable(sb, byChannel, "Channels / handling (work a listener has in hand)",
+                "complete/s  handled  failed   err%   avg_ms   p99_ms  handling",
+                (m) -> String.format("%10.0f %8d %7d %6s %8.3f %8.3f %9d",
+                        m.completionRate(), m.handled(), m.handledFailures(),
+                        pct(m.handleErrorRate()), m.handleLatency().avgMillis(),
+                        m.handleLatency().p99Millis(), m.handling()));
 
         // ---------- Buffers: only those holding something or that have dropped ----------
         List<BufferMetrics> busy = n.buffers().stream()
@@ -252,9 +272,16 @@ public class SpreaderReportEndpoint {
                 .toList();
         if (!busy.isEmpty()) {
             title(sb, "Buffers (non-empty only)");
+            sb.append(String.format("  %-22s %7s %9s %7s %8s %9s%n",
+                    "buffer", "size", "capacity", "usage", "dropped", "handled"));
+            sb.append("  ").append("-".repeat(22)).append(" ")
+                    .append("-".repeat(7)).append(" ").append("-".repeat(9)).append(" ")
+                    .append("-".repeat(7)).append(" ").append("-".repeat(8)).append(" ")
+                    .append("-".repeat(9)).append('\n');
             for (BufferMetrics b : busy) {
-                sb.append(String.format("  %-22s queued %-6d/%-6d usage %-6s dropped %d%n",
-                        b.name(), b.pending(), b.capacity(), pct(b.usage()), b.dropped()));
+                sb.append(String.format("  %-22s %7d %9d %7s %8d %9d%n",
+                        b.name(), b.pending(), b.capacity(), pct(b.usage()),
+                        b.dropped(), b.handled()));
             }
             // The fullest buffer is the next one to fill up. The list above is in its original
             // order, and with overload approaching nobody should have to compare them by hand
@@ -390,6 +417,32 @@ public class SpreaderReportEndpoint {
     private static void title(StringBuilder sb, String t) {
         sb.append('\n').append("── ").append(t).append(' ')
                 .append("─".repeat(Math.max(0, 60 - t.length()))).append('\n');
+    }
+
+    /**
+     * One stage's table: a header, a rule, then one row per channel.
+     *
+     * <p>Idle channels are left out. A test run or a quiet service can have a dozen
+     * channels that have never carried anything, and a table of zeroes buries the two rows
+     * that matter.
+     */
+    private static void channelTable(StringBuilder sb, Map<String, ChannelMetrics> byChannel,
+                                     String caption, String header,
+                                     Function<ChannelMetrics, String> row) {
+        List<Map.Entry<String, ChannelMetrics>> active = byChannel.entrySet().stream()
+                .filter(e -> !e.getValue().isIdle())
+                .toList();
+        if (active.isEmpty()) {
+            return;
+        }
+        sb.append('\n').append("  ").append(caption).append('\n');
+        sb.append(String.format("  %-22s %s%n", "channel", header));
+        sb.append("  ").append("-".repeat(22)).append(" ")
+                .append("-".repeat(header.length())).append('\n');
+        for (Map.Entry<String, ChannelMetrics> e : active) {
+            sb.append(String.format("  %-22s %s%n",
+                    MetricsRegistry.displayName(e.getKey()), row.apply(e.getValue())));
+        }
     }
 
     private static void kv(StringBuilder sb, String k, Object v) {

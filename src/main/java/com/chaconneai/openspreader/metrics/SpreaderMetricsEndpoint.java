@@ -22,6 +22,8 @@ import com.chaconneai.openspreader.scheduling.MultiProcessingTaskStats;
 import com.chaconneai.openspreader.sync.MutexService;
 import com.chaconneai.spreader.metrics.BufferMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
+import com.chaconneai.spreader.metrics.NodeMetrics;
 import com.chaconneai.spreader.metrics.LatencySnapshot;
 import com.chaconneai.spreader.metrics.SplitBrainStatus;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
@@ -146,14 +148,24 @@ public class SpreaderMetricsEndpoint {
         out.put("cluster", cluster());
 
         Map<String, Object> summary = new LinkedHashMap<>();
+        // Back, and no longer a sum: these read the node's own counters. NodeMetrics and
+        // ChannelMetrics are measured at their own points, so an instance-level figure is
+        // not the channels added together -- it also covers gossip's own traffic and
+        // anything that arrived without a channel to belong to
         summary.put("totalTps", round(n.totalTps()));
         summary.put("errorRate", round(n.errorRate()));
-        summary.put("channelCount", n.channels().size());
+        // Added, never replacing: the two above stay for whoever already reads them
+        summary.put("arrivalRate", round(n.arrivalRate()));
+        summary.put("completionRate", round(n.completionRate()));
+        summary.put("handling", n.traffic().handling());
+        summary.put("inflight", n.traffic().inflight());
+        Map<String, ChannelMetrics> byChannel = metrics.channels();
+        summary.put("channelCount", byChannel.size());
         // Business and framework channels are counted separately: framework channels, prefixed
         // spreader., are what the cache, the locks and RPC use for themselves, and their volume
         // is a different thing from business volume -- one combined number says nothing
-        summary.put("businessChannelCount", n.businessChannels().size());
-        summary.put("systemChannelCount", n.systemChannels().size());
+        summary.put("businessChannelCount", metrics.businessChannels().size());
+        summary.put("systemChannelCount", metrics.systemChannels().size());
         // Dropped messages happen silently, so a dashboard needs one conspicuous red light
         summary.put("hasDroppedMessages", n.hasDroppedMessages());
         // The fullest buffer is the next one to fill up. It is in the buffers list too, of
@@ -169,7 +181,7 @@ public class SpreaderMetricsEndpoint {
         out.put("summary", summary);
 
         Map<String, Object> channels = new LinkedHashMap<>();
-        n.channels().forEach((name, m) -> channels.put(displayName(name), toMap(m)));
+        metrics.channels().forEach((name, m) -> channels.put(displayName(name), toMap(m)));
         out.put("channels", channels);
 
         List<Map<String, Object>> buffers = new ArrayList<>();
@@ -305,7 +317,7 @@ public class SpreaderMetricsEndpoint {
     /** One channel. {@code default} means the user's default channel. */
     @ReadOperation
     public Map<String, Object> channel(@Selector String channel) {
-        String key = "default".equals(channel) ? "" : channel;
+        String key = MetricsRegistry.channelKey(channel);
         return toMap(metrics.channel(key));
     }
 
@@ -324,6 +336,13 @@ public class SpreaderMetricsEndpoint {
         // -- and the two overloads are investigated in entirely different places
         throughput.put("peakSentTps", round(m.peakSentTps()));
         throughput.put("peakReceivedTps", round(m.peakReceivedTps()));
+        // The three stages by their plain names. sentTps/receivedTps above stay as they are;
+        // arrivalRate is the same number as receivedTps, under a name that says what it is
+        throughput.put("sendRate", round(m.sendRate()));
+        throughput.put("arrivalRate", round(m.arrivalRate()));
+        throughput.put("completionRate", round(m.completionRate()));
+        throughput.put("handledTps", round(m.handledTps()));
+        throughput.put("peakHandledTps", round(m.peakHandledTps()));
         out.put("throughput", throughput);
 
         Map<String, Object> counters = new LinkedHashMap<>();
@@ -333,11 +352,23 @@ public class SpreaderMetricsEndpoint {
         counters.put("received", m.received());
         counters.put("receiveFailures", m.receiveFailures());
         counters.put("duplicates", m.duplicates());
+        counters.put("handled", m.handled());
+        counters.put("handledFailures", m.handledFailures());
         out.put("counters", counters);
 
+        // current/peak are the historical names and mean the OUTBOUND in-flight count.
+        // They stay, because other systems read them; inflight/peakInflight are the same
+        // numbers under a name that says which stage it is, and handling/peakHandling are
+        // the new stage: work a listener has in hand right now
         Map<String, Object> concurrency = new LinkedHashMap<>();
         concurrency.put("current", m.inflight());
         concurrency.put("peak", m.peakInflight());
+        concurrency.put("inflight", m.inflight());
+        concurrency.put("peakInflight", m.peakInflight());
+        concurrency.put("arriving", m.arriving());
+        concurrency.put("peakArriving", m.peakArriving());
+        concurrency.put("handling", m.handling());
+        concurrency.put("peakHandling", m.peakHandling());
         out.put("concurrency", concurrency);
 
         Map<String, Object> rates = new LinkedHashMap<>();
@@ -345,11 +376,13 @@ public class SpreaderMetricsEndpoint {
         rates.put("sendErrorRate", round(m.sendErrorRate()));
         rates.put("receiveErrorRate", round(m.receiveErrorRate()));
         rates.put("retryRate", round(m.retryRate()));
+        rates.put("handleErrorRate", round(m.handleErrorRate()));
         out.put("rates", rates);
 
         Map<String, Object> latency = new LinkedHashMap<>();
         latency.put("outbound", toMap(m.outboundLatency()));
         latency.put("inbound", toMap(m.inboundProcessing()));
+        latency.put("handling", toMap(m.handleLatency()));
         out.put("latencyMillis", latency);
 
         return out;
@@ -370,8 +403,9 @@ public class SpreaderMetricsEndpoint {
     }
 
     private static String displayName(String channel) {
-        return channel == null || channel.isEmpty() ? "default" : channel;
+        return MetricsRegistry.displayName(channel);
     }
+
 
     /** Three decimal places. A long floating-point tail in JSON is only a distraction. */
     private static double round(double v) {

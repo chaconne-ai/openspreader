@@ -68,16 +68,44 @@ public class BarrierEntry {
     }
 
     /**
+     * What one arrival yields: where in the queue it landed, and which generation it joined.
+     *
+     * <p>The two travel together on purpose. They used to be fetched separately -- the index
+     * from {@code arrive()} and the generation from {@code generation()} right afterwards --
+     * and that cost a party its entire timeout about three quarters of the time under load.
+     *
+     * <p>The race: a party arrives as index 0 of 3 and, before it gets round to reading the
+     * generation, the other two arrive and fill the barrier, which moves the generation on.
+     * The first party then reads the <b>new</b> generation and settles down to wait for one
+     * beyond it. But the round it is in has already been released, and the generation will
+     * not move again until the next round, so its only way out is the timeout. A waiter
+     * decides it has been released by "the current generation is beyond the one I entered
+     * on", and entering on the wrong one makes that test unanswerable.
+     *
+     * @param index      the arrival index: {@code parties - 1} means this party arrived last
+     *                   and its arrival releases the round; -1 when the barrier is broken
+     * @param generation the generation this party joined, read under the same lock that
+     *                   assigned the index
+     * @param released   whether this arrival filled the barrier
+     */
+    record Arrival(long index, long generation, boolean released) {
+    }
+
+    /**
      * Arrives at the barrier.
      *
-     * @return the arrival index: {@code parties - 1} means this party arrived last and its
-     *         arrival releases the round. Returns -1 when the barrier is already broken
+     * <p>Returns the generation alongside the index, so that the caller never has to ask for
+     * it in a second call. See {@link Arrival} for what went wrong when it did.
      */
-    synchronized long arrive(String participantId, String nodeId) {
+    synchronized Arrival arrive(String participantId, String nodeId) {
         touch();
         if (broken) {
-            return -1L;
+            return new Arrival(-1L, generation, false);
         }
+        // Read before the possible increment below: a party that does not fill the barrier
+        // must report the generation it JOINED, or it can never tell that its round has
+        // since been released
+        long joined = generation;
         arrived.add(participantId);
         participantNodes.put(participantId, nodeId);
         long index = arrived.size() - 1L;
@@ -86,9 +114,9 @@ public class BarrierEntry {
             generation++;
             arrived.clear();
             participantNodes.clear();
-            return parties - 1L;
+            return new Arrival(parties - 1L, joined, true);
         }
-        return index;
+        return new Arrival(index, joined, false);
     }
 
     /**

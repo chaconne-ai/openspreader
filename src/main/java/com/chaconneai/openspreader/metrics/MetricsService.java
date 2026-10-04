@@ -20,6 +20,7 @@ import com.chaconneai.spreader.GossipCluster;
 import com.chaconneai.spreader.Node;
 import com.chaconneai.spreader.metrics.BufferMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.NodeMetrics;
 import com.chaconneai.spreader.metrics.SplitBrainStatus;
 
 import java.util.ArrayList;
@@ -74,6 +75,14 @@ public class MetricsService {
      * costs a walk over the channels to summarise them -- a matter of microseconds, safe to
      * call directly inside an HTTP request.
      */
+    /**
+     * Assembles the snapshot rather than delegating to {@code cluster.nodeMetrics()}.
+     *
+     * <p>The difference is {@link #buffers()}: spreader's own call sees spreader's buffers,
+     * while this one adds the bounded pool queues the cache, task dispatch and RPC use. Both
+     * are "a full queue means messages are gone", so reporting only half would be worse than
+     * assembling the record twice.
+     */
     public NodeMetrics snapshot() {
         Node self = cluster.self();
         Node leader = cluster.leader();
@@ -88,8 +97,8 @@ public class MetricsService {
                 cluster.members().size(),
                 System.currentTimeMillis() - startedAt,
                 System.currentTimeMillis(),
-                cluster.metrics(),
-                buffers());
+                buffers(),
+                cluster.splitBrainStatus());
     }
 
     /**
@@ -171,14 +180,23 @@ public class MetricsService {
         return cluster.metrics(name);
     }
 
-    /** The user's own business channels only. */
+    /**
+     * The user's own business channels only.
+     *
+     * <p>Filtered from {@link #channels()} rather than from {@code snapshot()}: the two
+     * levels are measured separately, so {@link NodeMetrics} carries no channel map.
+     */
     public List<ChannelMetrics> businessChannels() {
-        return snapshot().businessChannels();
+        return cluster.metrics().values().stream()
+                .filter(c -> !c.isSystemChannel())
+                .toList();
     }
 
     /** The framework's channels only: cache, locks, RPC, task dispatch. */
     public List<ChannelMetrics> systemChannels() {
-        return snapshot().systemChannels();
+        return cluster.metrics().values().stream()
+                .filter(ChannelMetrics::isSystemChannel)
+                .toList();
     }
 
     /**
